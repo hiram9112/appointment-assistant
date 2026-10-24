@@ -63,7 +63,7 @@ The V1 must also:
 - preserve an audit history of Appointment-changing actions;
 - expose the customer-facing conversational experience through supported text-based channels;
 - provide a public web experience that presents Appointment Assistant, its purpose and core capabilities, and demonstrates the real application through a conversational interface and a read-only Appointment calendar reflecting Appointment creation, rescheduling and cancellation.
-- require Customer registration before creating an Appointment;
+- require Customer registration before creating a real Business Appointment;
 - maintain persistent Customer identity across Appointments and Conversations;
 - associate each registered Customer with a verified mobile phone and their
   WhatsApp channel identity.
@@ -103,8 +103,8 @@ without yet having a persistent Customer registration.
 A Contact may ask for Business information, Services, prices, Professionals and
 Appointment availability.
 
-A Contact must complete Customer registration before an Appointment can be
-created.
+A Contact using a real Business interaction channel must complete Customer
+registration before a real Business Appointment can be created.
 
 ### Customer
 
@@ -181,7 +181,7 @@ Each Professional has configurable information including:
 Business-level scheduling policies may include:
 
 - Professional selection behavior;
-- cancellation rules, including any minimum notice period;
+- cancellation and rescheduling rules, including any minimum notice period;
 - whether Customer reminders are enabled;
 - reminder timing when reminders are enabled.
 
@@ -453,7 +453,8 @@ The system identifies the existing Appointment and determines valid alternatives
 according to the same availability and scheduling rules used for new
 Appointments.
 
-Before applying the change, the system must verify that the new slot is still
+Before applying the change, the system must verify that rescheduling is
+permitted under the applicable Business policy and that the new slot is still
 available and satisfies all applicable scheduling rules.
 
 The existing Appointment must remain valid until the rescheduling operation has
@@ -791,8 +792,9 @@ registration before a real Business Appointment can be created.
 
 **Expected behavior**
 
-When an unregistered Contact attempts to create an Appointment, the system must
-start the Customer registration flow before completing the booking.
+When an unregistered Contact attempts to create a real Business Appointment,
+the system must start the Customer registration flow before completing the
+booking.
 
 The system must:
 
@@ -1008,6 +1010,12 @@ A successful rescheduling must:
 - preserve the Customer association;
 - produce the corresponding audit record;
 - trigger the applicable schedule synchronization and Professional notification.
+
+Rescheduling may be restricted by configurable Business rules, including a
+minimum notice period.
+
+If rescheduling is not permitted under the configured policy, the existing
+Appointment must remain unchanged and the Customer must be clearly informed.
 
 Rescheduling consistency must be enforced by the application and must not depend
 on the conversational assistant.
