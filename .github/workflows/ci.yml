@@ -83,6 +83,9 @@ jobs:
       - name: Run backend tests
         run: composer test
 
+      - name: Check backend code style
+        run: composer lint
+
   public-web:
     name: Public Web
     runs-on: ubuntu-24.04

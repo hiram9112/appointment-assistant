@@ -28,7 +28,7 @@ The Agent:
 - reads only the existing code relevant to that work and any areas that may reasonably be affected by the change;
 - follows the approved slice plan;
 - adds or modifies the tests required by that plan;
-- runs the project test suite after implementation;
+- runs the automated validation required for the affected application after implementation;
 - reports what was changed and verified.
 
 The Agent does not redesign the requested implementation unless a real conflict or blocker is discovered.
@@ -60,6 +60,16 @@ For each implementation task:
 3. inspect only the existing code relevant to the requested work and possible regressions.
 
 Do not read the entire repository before every task.
+
+### Nested instructions
+
+This file defines repository-wide rules.
+
+When working in a directory that contains a more specific `AGENTS.md`, read and follow it in addition to this file.
+
+For backend work, also read the applicable committed rules under `backend/.ai/rules/` as directed by `backend/AGENTS.md`.
+
+Project-specific architecture, slice plans and committed project rules take precedence over generic framework guidance when they conflict.
 
 ### Product
 
@@ -105,13 +115,23 @@ Do not expand scope because a future requirement might benefit from it.
 
 If a real ambiguity, contradiction or missing design decision appears during implementation, report it instead of choosing a significant design direction silently.
 
+### Repository boundaries
+
+`backend/` contains the Laravel application core.
+
+`public-web/` contains the standalone React and TypeScript public frontend.
+
+Do not move responsibilities across these application boundaries or introduce tooling from one application into the other unless the approved slice plan explicitly requires it.
+
 ---
 
 ## 5. Tests and verification
 
 Create or update the tests specified by the active slice plan.
 
-After each requested implementation task, run the complete automated test suite.
+After each requested implementation task, run the complete automated validation relevant to the affected application.
+
+Run repository-wide mandatory checks when required by the active slice plan or completion criteria.
 
 If the project defines additional mandatory checks for that task, run them as well.
 

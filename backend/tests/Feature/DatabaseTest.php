@@ -14,5 +14,9 @@ class DatabaseTest extends TestCase
     {
         $this->assertSame('testing', app()->environment());
         $this->assertSame('pgsql', DB::connection()->getDriverName());
+        $this->assertSame(
+            'appointment_assistant_test',
+            DB::connection()->getDatabaseName(),
+        );
     }
 }

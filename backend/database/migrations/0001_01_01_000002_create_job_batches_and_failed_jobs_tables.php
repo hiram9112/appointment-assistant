@@ -11,7 +11,6 @@ return new class extends Migration
      */
     public function up(): void
     {
-       
 
         Schema::create('job_batches', function (Blueprint $table) {
             $table->string('id')->primary();
@@ -43,7 +42,7 @@ return new class extends Migration
      * Reverse the migrations.
      */
     public function down(): void
-    {        
+    {
         Schema::dropIfExists('job_batches');
         Schema::dropIfExists('failed_jobs');
     }
