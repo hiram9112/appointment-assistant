@@ -5,10 +5,13 @@
 .env.production
 .env.testing
 .phpunit.result.cache
-/.codex
 /.phpunit.cache
 /.vscode
 /public/storage
 /storage/pail
 /vendor
 Thumbs.db
+
+# Laravel Boost generated agent resources
+/.agents/
+
