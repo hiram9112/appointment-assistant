@@ -37,5 +37,27 @@ class BusinessSeeder extends Seeder
                 'closes_at' => $weekday === 'saturday' ? '14:00:00' : '20:00:00',
             ]);
         }
+
+        $services = [
+            ['Initial beauty consultation', 30, '0.00'],
+            ['Deep facial cleansing', 60, '55.00'],
+            ['Hydrating facial treatment', 60, '65.00'],
+            ['Premium facial treatment', 90, '85.00'],
+            ['Laser hair removal — underarms', 20, '25.00'],
+            ['Laser hair removal — full legs', 45, '65.00'],
+            ['Firming body treatment', 60, '70.00'],
+            ['Wellness massage', 60, '50.00'],
+        ];
+
+        foreach ($services as [$name, $duration, $price]) {
+            $business->services()->updateOrCreate(['name' => $name], [
+                'description' => null,
+                'duration_minutes' => $duration,
+                'price_amount' => $price,
+                'currency_code' => 'EUR',
+                'active' => true,
+            ])->id;
+        }
+
     }
 }

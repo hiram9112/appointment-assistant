@@ -44,4 +44,9 @@ class Business extends Model
     {
         return $this->hasMany(BusinessOperatingHour::class);
     }
+
+    public function services(): HasMany
+    {
+        return $this->hasMany(Service::class);
+    }
 }
