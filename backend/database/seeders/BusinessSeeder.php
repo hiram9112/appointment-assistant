@@ -59,5 +59,19 @@ class BusinessSeeder extends Seeder
             ])->id;
         }
 
+        foreach ([
+            ['Laura', 'Martín'],
+            ['Marta', 'Ruiz'],
+            ['Claudia', 'Pérez'],
+            ['Sara', 'Gómez'],
+        ] as [$firstName, $lastName]) {
+            $business->professionals()->updateOrCreate([
+                'first_name' => $firstName,
+                'last_name' => $lastName,
+            ], [
+                'display_name' => null,
+            ]);
+        }
+
     }
 }

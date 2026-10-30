@@ -49,4 +49,9 @@ class Business extends Model
     {
         return $this->hasMany(Service::class);
     }
+
+    public function professionals(): HasMany
+    {
+        return $this->hasMany(Professional::class);
+    }
 }

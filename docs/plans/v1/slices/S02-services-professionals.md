@@ -52,17 +52,30 @@ Expected `professionals` data:
 - `business_id`;
 - `first_name`;
 - `last_name`;
+- `display_name`, nullable;
 - Laravel timestamps.
 
 A Professional belongs to one Business.
 
 A Business has many Professionals.
 
+`id` is the internal Professional identity.
+
 Names are not identifiers and must not be unique.
 
-Two Professionals may share the same `first_name`, and identity is always represented internally by `id`.
+Two Professionals may share the same `first_name`, `last_name`, or complete configured name.
 
-Do not introduce Professional availability, breaks, scheduling exceptions, specialty classification or additional display-name infrastructure in S02.
+`last_name` may contain the surname or surnames the Business chooses to configure.
+
+`display_name` is optional customer-facing display information.
+
+When configured, `display_name` may provide a public name or alias that allows Customers to distinguish a Professional from others.
+
+`display_name` is not an identifier and must not be unique.
+
+When no explicit `display_name` is configured, customer-facing application results use the Professional's configured first and last name as the display name.
+
+Do not introduce Professional availability, breaks, scheduling exceptions, specialty classification or additional Professional identity infrastructure in S02.
 
 ### Professional-Service eligibility
 
@@ -91,7 +104,13 @@ For V1, the pivot schema does not introduce composite Business constraints. Cros
 
 Use the applicable Service, Professional and eligibility configuration from `docs/reference-business.md`.
 
-Reference seeding must be deterministic.
+Reference seeding is development/reference-data initialization and should be repeatable for the expected development workflow.
+
+Canonical reference records should be restored when reseeded without treating the seed as a production catalogue synchronization mechanism.
+
+Unrelated Business configuration must not be deleted merely because it is absent from `docs/reference-business.md`.
+
+The Lúmina reference Professionals have no configured public aliases unless `docs/reference-business.md` explicitly defines one.
 
 Professional-Service eligibility should converge to the canonical reference configuration when the seed is executed repeatedly.
 
@@ -152,7 +171,13 @@ containing:
 
 - `id`;
 - `firstName`;
-- `lastName`.
+- `lastName`;
+- `displayName`.
+
+`displayName` is the customer-facing Professional name:
+
+- use the configured `display_name` when present;
+- otherwise fall back to the configured first and last name.
 
 The capability result contains structured facts, not customer-facing conversational prose.
 
@@ -180,6 +205,7 @@ S02 does not implement:
 - temporary availability exceptions or blocks;
 - Appointment availability calculation;
 - Professional selection behavior;
+- ambiguity-resolution conversational flows;
 - Appointment creation or modification;
 - AI tools or prompts;
 - HTTP/API interfaces;
@@ -220,7 +246,8 @@ Do not introduce Professionals yet.
 - duration is stored as numeric minutes;
 - price uses exact decimal persistence;
 - active status is persisted;
-- Lúmina's reference Services are seeded correctly.
+- Lúmina's reference Services are seeded correctly;
+- repeated reference seeding restores canonical reference Service configuration without deleting unrelated Services.
 
 ## Tests
 
@@ -232,7 +259,7 @@ Cover at least:
 4. zero price distinct from null;
 5. duration and active-state persistence;
 6. reference Service seed data;
-7. repeated reference seeding is idempotent, restores canonical reference Service configuration, and preserves unrelated Services
+7. repeated reference seeding is idempotent for canonical reference Services and preserves unrelated Services.
 
 Do not implement Task 2 as part of this task.
 
@@ -251,10 +278,11 @@ Implement:
 - `professionals` migration;
 - `Professional` Eloquent model;
 - `Business` ↔ `Professional` relationships;
-- deterministic Lúmina Professional seed data;
+- nullable `display_name` customer-facing configuration;
+- deterministic Lúmina Professional seed data for the expected development workflow;
 - relevant automated tests.
 
-Use only the Professional identity information required by S02 from `docs/reference-business.md`.
+Use only the Professional identity and display information required by S02 from `docs/reference-business.md`.
 
 Do not seed Professional scheduling data.
 
@@ -263,9 +291,14 @@ Do not seed Professional scheduling data.
 - a Professional belongs to one Business;
 - a Business retrieves its Professionals;
 - first and last names are persisted separately;
-- names are not unique identifiers;
-- multiple Professionals may share the same first name;
-- Lúmina's reference Professionals are seeded correctly.
+- `last_name` may contain one or more configured surnames;
+- `display_name` may be null;
+- a configured `display_name` is persisted;
+- names and display names are not unique identifiers;
+- multiple Professionals may share the same first name or complete configured name;
+- distinct Professionals remain identifiable internally by `id`;
+- Lúmina's reference Professionals are seeded correctly;
+- reference reseeding does not delete unrelated Professionals.
 
 ## Tests
 
@@ -273,10 +306,12 @@ Cover at least:
 
 1. Professional persistence;
 2. Business relationship;
-3. multiple Professionals sharing a first name;
-4. distinct Professionals remain distinguishable by `id`;
-5. reference Professional seed data;
-6. repeated reference seeding does not create duplicate Professionals.
+3. nullable and configured `display_name`;
+4. multiple Professionals sharing a first name;
+5. multiple Professionals may share the same complete name and remain distinguishable by `id`;
+6. `display_name` does not define Professional identity;
+7. reference Professional seed data;
+8. repeated reference seeding preserves canonical reference records and unrelated Professionals in the expected development workflow.
 
 Do not implement Task 3 as part of this task.
 
@@ -389,6 +424,11 @@ Eligible Professionals must:
 
 - come from configured eligibility;
 - belong to the supplied Business;
+- expose their internal `id`;
+- expose `firstName` and `lastName`;
+- expose a customer-facing `displayName`;
+- use configured `display_name` for `displayName` when present;
+- otherwise derive `displayName` from the configured first and last name;
 - be ordered by first name, last name and id;
 - not include availability information;
 - not expose cross-Business Professionals even if inconsistent pivot data exists.
@@ -401,6 +441,7 @@ Eligible Professionals must:
 - price and duration come from authoritative configuration;
 - zero price remains distinguishable from unavailable price;
 - eligible Professionals are determined from configuration;
+- customer-facing Professional names respect configured `display_name` and its fallback;
 - nonexistent, inactive and other-Business Service references fail safely;
 - cross-Business Professionals are not exposed as eligible;
 - no conversational inference or scheduling calculation is required.
@@ -415,12 +456,14 @@ Cover at least:
 4. nullable description/price behavior;
 5. free Service behavior;
 6. eligible Professional retrieval;
-7. deterministic Professional ordering;
-8. inactive Service exclusion;
-9. nonexistent Service;
-10. other-Business Service isolation;
-11. cross-Business Professional exclusion;
-12. Lúmina reference data exercising the capabilities.
+7. configured Professional `display_name`;
+8. customer-facing display-name fallback when no alias is configured;
+9. deterministic Professional ordering;
+10. inactive Service exclusion;
+11. nonexistent Service;
+12. other-Business Service isolation;
+13. cross-Business Professional exclusion;
+14. Lúmina reference data exercising the capabilities.
 
 ---
 
@@ -431,9 +474,11 @@ S02 is complete when:
 - Services are authoritative PostgreSQL Business configuration;
 - Service duration and price are structured authoritative values;
 - Professionals are persistent Business configuration;
+- Professional customer-facing display information is represented explicitly;
 - Professional-Service eligibility is persistent configuration;
 - active Services can be retrieved deterministically;
 - eligible Professionals can be determined without inference;
+- customer-facing Professional names can be exposed deterministically;
 - invalid, inactive and cross-Business Service references fail safely;
 - S02 does not calculate Professional availability;
 - reference Business data exercises the implementation;
