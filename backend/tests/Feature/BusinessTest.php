@@ -52,6 +52,64 @@ class BusinessTest extends TestCase
         Business::factory()->create(['timezone' => null]);
     }
 
+    public function test_customer_facing_configuration_is_persisted_and_cast(): void
+    {
+        $configuration = [
+            'payment_methods' => ['card', 'cash'],
+            'appointments_recommended' => true,
+            'arrival_lead_minutes' => 5,
+            'cancellation_notice_minutes' => 1440,
+            'rescheduling_notice_minutes' => 720,
+        ];
+
+        $business = Business::factory()->create($configuration);
+        $retrieved = Business::findOrFail($business->id);
+
+        $this->assertSame($configuration, $retrieved->only(array_keys($configuration)));
+    }
+
+    public function test_customer_facing_configuration_can_be_unavailable(): void
+    {
+        $fields = [
+            'payment_methods', 'appointments_recommended', 'arrival_lead_minutes',
+            'cancellation_notice_minutes', 'rescheduling_notice_minutes',
+        ];
+
+        $business = Business::factory()->create();
+        $retrieved = Business::findOrFail($business->id);
+
+        $this->assertSame(array_fill_keys($fields, null), $retrieved->only($fields));
+    }
+
+    public function test_false_recommendation_empty_payment_methods_and_zero_minutes_are_preserved(): void
+    {
+        $configuration = [
+            'payment_methods' => [],
+            'appointments_recommended' => false,
+            'arrival_lead_minutes' => 0,
+            'cancellation_notice_minutes' => 0,
+            'rescheduling_notice_minutes' => 0,
+        ];
+
+        $business = Business::factory()->create($configuration);
+        $retrieved = Business::findOrFail($business->id);
+
+        $this->assertSame($configuration, $retrieved->only(array_keys($configuration)));
+    }
+
+    public function test_reference_business_customer_facing_configuration_is_seeded(): void
+    {
+        $this->seed();
+
+        $business = Business::where('name', 'Lúmina Estética Avanzada')->firstOrFail();
+
+        $this->assertSame(['card', 'cash'], $business->payment_methods);
+        $this->assertTrue($business->appointments_recommended);
+        $this->assertSame(5, $business->arrival_lead_minutes);
+        $this->assertSame(1440, $business->cancellation_notice_minutes);
+        $this->assertSame(1440, $business->rescheduling_notice_minutes);
+    }
+
     public function test_default_seeder_creates_reference_business_core_profile(): void
     {
         $this->seed();

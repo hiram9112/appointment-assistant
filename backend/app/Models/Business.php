@@ -22,7 +22,23 @@ class Business extends Model
         'country_code',
         'phone',
         'email',
+        'payment_methods',
+        'appointments_recommended',
+        'arrival_lead_minutes',
+        'cancellation_notice_minutes',
+        'rescheduling_notice_minutes',
     ];
+
+    protected function casts(): array
+    {
+        return [
+            'payment_methods' => 'array',
+            'appointments_recommended' => 'boolean',
+            'arrival_lead_minutes' => 'integer',
+            'cancellation_notice_minutes' => 'integer',
+            'rescheduling_notice_minutes' => 'integer',
+        ];
+    }
 
     public function operatingHours(): HasMany
     {

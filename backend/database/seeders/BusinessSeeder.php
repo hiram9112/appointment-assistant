@@ -21,6 +21,11 @@ class BusinessSeeder extends Seeder
             'country_code' => 'ES',
             'phone' => '+34 600 000 000',
             'email' => 'hola@lumina-demo.test',
+            'payment_methods' => ['card', 'cash'],
+            'appointments_recommended' => true,
+            'arrival_lead_minutes' => 5,
+            'cancellation_notice_minutes' => 1440,
+            'rescheduling_notice_minutes' => 1440,
         ]);
 
         $business->operatingHours()->delete();
