@@ -49,8 +49,9 @@ class BusinessSeeder extends Seeder
             ['Wellness massage', 60, '50.00'],
         ];
 
+        $serviceIds = [];
         foreach ($services as [$name, $duration, $price]) {
-            $business->services()->updateOrCreate(['name' => $name], [
+            $serviceIds[$name] = $business->services()->updateOrCreate(['name' => $name], [
                 'description' => null,
                 'duration_minutes' => $duration,
                 'price_amount' => $price,
@@ -60,17 +61,20 @@ class BusinessSeeder extends Seeder
         }
 
         foreach ([
-            ['Laura', 'Martín'],
-            ['Marta', 'Ruiz'],
-            ['Claudia', 'Pérez'],
-            ['Sara', 'Gómez'],
-        ] as [$firstName, $lastName]) {
-            $business->professionals()->updateOrCreate([
+            ['Laura', 'Martín', ['Initial beauty consultation', 'Deep facial cleansing', 'Hydrating facial treatment', 'Premium facial treatment']],
+            ['Marta', 'Ruiz', ['Initial beauty consultation', 'Laser hair removal — underarms', 'Laser hair removal — full legs']],
+            ['Claudia', 'Pérez', ['Initial beauty consultation', 'Firming body treatment', 'Wellness massage']],
+            ['Sara', 'Gómez', ['Initial beauty consultation', 'Deep facial cleansing', 'Hydrating facial treatment', 'Laser hair removal — underarms', 'Firming body treatment']],
+        ] as [$firstName, $lastName, $eligibleServices]) {
+            $professional = $business->professionals()->updateOrCreate([
                 'first_name' => $firstName,
                 'last_name' => $lastName,
             ], [
                 'display_name' => null,
             ]);
+            $eligibleIds = array_map(fn (string $name): int => $serviceIds[$name], $eligibleServices);
+            $professional->services()->detach(array_values(array_diff($serviceIds, $eligibleIds)));
+            $professional->services()->syncWithoutDetaching($eligibleIds);
         }
 
     }
