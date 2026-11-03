@@ -414,10 +414,8 @@ Follow existing Laravel persistence, relationship, factory and seeding conventio
 - Professional recurring availability is persistent configuration;
 - multiple intervals for the same weekday are supported;
 - breaks can be represented through gaps;
-- Business and Professional scheduling exceptions are supported;
-- positive and blocked exceptions are distinguishable;
-- blocked time takes precedence over availability;
-- Professional availability outside normal Business hours requires an applicable Business availability exception;
+- Business and Professional scheduling exceptions are persisted;
+- positive and blocked exceptions are distinguishable for both scopes;
 - Lúmina scheduling configuration is seeded deterministically.
 
 ## Tests
@@ -432,10 +430,9 @@ Cover at least:
 6. Professional partial block;
 7. Professional full-day block;
 8. positive availability exception;
-9. blocked-period precedence;
-10. Lúmina recurring schedules;
-11. Lúmina temporary exceptions;
-12. deterministic repeated seeding.
+9. Lúmina recurring schedules;
+10. Lúmina temporary exceptions;
+11. deterministic repeated seeding.
 
 Do not implement Task 3 as part of this task.
 
@@ -494,7 +491,8 @@ The PostgreSQL-backed implementation is deferred to S05.
 - Professional recurring availability constrains availability;
 - breaks and unavailable periods are respected;
 - Business and Professional exceptions modify effective availability correctly;
-- blocks override ordinary availability;
+- blocked periods take precedence over recurring and additional availability;
+- Professional availability outside normal Business hours requires an applicable Business availability exception;
 - Service duration and buffers must fit completely;
 - supplied Appointment occupancy removes otherwise valid availability;
 - occupied periods can split continuous availability;
@@ -519,7 +517,9 @@ Cover at least:
 12. active Appointment occupancy;
 13. occupancy splitting availability;
 14. adjacent non-overlapping occupancy;
-15. multiple resulting availability intervals.
+15. multiple resulting availability intervals;
+16. blocked-period precedence over recurring and additional availability;
+17. Professional availability outside Business hours with and without an applicable Business availability exception.
 
 Do not implement Task 4 as part of this task.
 

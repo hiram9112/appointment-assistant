@@ -3,6 +3,7 @@
 namespace Database\Seeders;
 
 use App\Models\Business;
+use Carbon\CarbonImmutable;
 use Illuminate\Database\Seeder;
 
 class BusinessSeeder extends Seeder
@@ -62,6 +63,7 @@ class BusinessSeeder extends Seeder
             ])->id;
         }
 
+        $professionalIds = [];
         foreach ([
             ['Laura', 'Martín', ['Initial beauty consultation', 'Deep facial cleansing', 'Hydrating facial treatment', 'Premium facial treatment']],
             ['Marta', 'Ruiz', ['Initial beauty consultation', 'Laser hair removal — underarms', 'Laser hair removal — full legs']],
@@ -77,7 +79,54 @@ class BusinessSeeder extends Seeder
             $eligibleIds = array_map(fn (string $name): int => $serviceIds[$name], $eligibleServices);
             $professional->services()->detach(array_values(array_diff($serviceIds, $eligibleIds)));
             $professional->services()->syncWithoutDetaching($eligibleIds);
+            $professionalIds[$firstName] = $professional->id;
         }
 
+        $schedules = [
+            'Laura' => [
+                [['monday', 'tuesday', 'wednesday', 'thursday', 'friday'], [['09:00', '13:30'], ['14:30', '17:00']]],
+            ],
+            'Marta' => [
+                [['monday', 'tuesday', 'wednesday', 'thursday'], [['11:00', '15:00'], ['16:00', '20:00']]],
+                [['friday'], [['09:00', '15:00'], ['16:00', '17:00']]],
+            ],
+            'Claudia' => [
+                [['tuesday', 'wednesday', 'thursday', 'friday'], [['10:00', '14:00'], ['15:00', '19:00']]],
+                [['saturday'], [['09:00', '14:00']]],
+            ],
+            'Sara' => [
+                [['monday', 'tuesday', 'wednesday'], [['12:00', '14:00'], ['15:00', '20:00']]],
+                [['thursday', 'friday'], [['09:00', '14:00'], ['15:00', '17:00']]],
+            ],
+        ];
+
+        foreach ($schedules as $name => $schedule) {
+            $professional = $business->professionals()->findOrFail($professionalIds[$name]);
+            foreach ($schedule as [$weekdays, $intervals]) {
+                foreach ($weekdays as $weekday) {
+                    foreach ($intervals as [$startsAt, $endsAt]) {
+                        $professional->availabilityIntervals()->firstOrCreate([
+                            'weekday' => $weekday,
+                            'starts_at' => $startsAt.':00',
+                            'ends_at' => $endsAt.':00',
+                        ]);
+                    }
+                }
+            }
+        }
+
+        foreach ([
+            ['Laura', '2026-11-10 09:00', '2026-11-10 12:00', 'Personal block.'],
+            ['Marta', '2026-11-12 17:00', '2026-11-12 20:00', 'Professional unavailable.'],
+            ['Claudia', '2026-11-13 00:00', '2026-11-14 00:00', null],
+            [null, '2026-11-11 18:00', '2026-11-11 20:00', null],
+        ] as [$name, $startsAt, $endsAt, $reason]) {
+            $business->scheduleExceptions()->updateOrCreate([
+                'professional_id' => $name === null ? null : $professionalIds[$name],
+                'starts_at' => CarbonImmutable::parse($startsAt, $business->timezone)->utc()->format('Y-m-d H:i:s'),
+                'ends_at' => CarbonImmutable::parse($endsAt, $business->timezone)->utc()->format('Y-m-d H:i:s'),
+                'kind' => 'blocked',
+            ], ['reason' => $reason]);
+        }
     }
 }
