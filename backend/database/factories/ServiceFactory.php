@@ -17,6 +17,8 @@ class ServiceFactory extends Factory
             'name' => fake()->words(3, true),
             'description' => null,
             'duration_minutes' => 60,
+            'buffer_before_minutes' => 0,
+            'buffer_after_minutes' => 0,
             'price_amount' => null,
             'currency_code' => null,
             'active' => true,

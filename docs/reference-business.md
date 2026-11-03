@@ -79,20 +79,20 @@ A Professional may only receive Appointments during their own availability withi
 
 ## 5. Services
 
-| Service                        | Duration | Price |
-| ------------------------------ | -------: | ----: |
-| Initial beauty consultation    |   30 min |    €0 |
-| Deep facial cleansing          |   60 min |   €55 |
-| Hydrating facial treatment     |   60 min |   €65 |
-| Premium facial treatment       |   90 min |   €85 |
-| Laser hair removal — underarms |   20 min |   €25 |
-| Laser hair removal — full legs |   45 min |   €65 |
-| Firming body treatment         |   60 min |   €70 |
-| Wellness massage               |   60 min |   €50 |
+| Service                        | Duration | Price | Buffer before | Buffer after |
+| ------------------------------ | -------: | ----: | ------------: | -----------: |
+| Initial beauty consultation    |   30 min |    €0 |         0 min |        0 min |
+| Deep facial cleansing          |   60 min |   €55 |         5 min |       10 min |
+| Hydrating facial treatment     |   60 min |   €65 |         5 min |       10 min |
+| Premium facial treatment       |   90 min |   €85 |        10 min |       10 min |
+| Laser hair removal — underarms |   20 min |   €25 |         5 min |        5 min |
+| Laser hair removal — full legs |   45 min |   €65 |         5 min |       10 min |
+| Firming body treatment         |   60 min |   €70 |         5 min |       10 min |
+| Wellness massage               |   60 min |   €50 |         5 min |       10 min |
 
 All Services are active in the V1 reference configuration.
 
-Service duration and price are Business configuration data and must not be embedded in application logic.
+Service duration, price and scheduling buffers are Business configuration data and must not be embedded in application logic.
 
 ---
 
@@ -204,7 +204,7 @@ A valid Appointment requires:
 - the Business to be open;
 - the selected Professional to be available;
 - the Professional to be eligible for the selected Service;
-- the complete Service duration to fit inside the available period;
+- the complete scheduling occupancy, including configured buffers, to fit inside the available period;
 - no conflicting Appointment to exist.
 
 ### Cancellation and rescheduling
@@ -265,7 +265,7 @@ The Business closes exceptionally at:
 
 `18:00`
 
-Appointments ending after 18:00 are not valid on that date.
+Scheduling occupancy extending after 18:00 is not valid on that date.
 
 These exceptions are reference data and do not represent special-case application logic.
 

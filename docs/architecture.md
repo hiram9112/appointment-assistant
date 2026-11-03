@@ -257,11 +257,14 @@ Customer with a persistent application identity.
 
 A registered Customer is associated with:
 
-- a verified mobile phone;
-- the WhatsApp channel identity used by the Customer.
+- their name and the persistent channel identity supplied by the supported real channel;
+- optional phone contact data, when provided.
 
 The WhatsApp channel identity is used to resolve the same Customer across
 subsequent Conversations.
+
+Phone numbers are optional contact data, not mandatory authentication evidence;
+phone verification is not an application boundary for Appointment creation.
 
 Customer identity is owned by the Laravel application and must not depend
 exclusively on Conversation state or the AI layer.

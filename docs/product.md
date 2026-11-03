@@ -65,8 +65,7 @@ The V1 must also:
 - provide a public web experience that presents Appointment Assistant, its purpose and core capabilities, and demonstrates the real application through a conversational interface and a read-only Appointment calendar reflecting Appointment creation, rescheduling and cancellation.
 - require Customer registration before creating a real Business Appointment;
 - maintain persistent Customer identity across Appointments and Conversations;
-- associate each registered Customer with a verified mobile phone and their
-  WhatsApp channel identity.
+- associate each registered Customer with their persistent supported channel identity.
 
 ## 4. V1 scope boundaries
 
@@ -111,11 +110,11 @@ registration before a real Business Appointment can be created.
 Person who has completed the required V1 registration and has a persistent
 Customer record in the application.
 
-A Customer is identified by:
+A Customer has:
 
 - name;
-- verified mobile phone;
-- associated WhatsApp channel identity.
+- an associated persistent supported channel identity;
+- optional phone contact data.
 
 A Customer may create, view, reschedule and cancel their Appointments.
 
@@ -163,6 +162,7 @@ Each Service has configurable information including:
 - name;
 - description when applicable;
 - duration;
+- scheduling buffers before and after the Service, defaulting to zero;
 - price when applicable;
 - active status.
 
@@ -328,7 +328,7 @@ Customer.
 
 The system returns valid Appointment slots according to:
 
-- Service duration;
+- Service duration and configured scheduling buffers;
 - Professional eligibility for the requested Service;
 - Professional availability;
 - Business scheduling rules;
@@ -787,8 +787,7 @@ registration before a real Business Appointment can be created.
 **Required information**
 
 - name;
-- mobile phone;
-- WhatsApp channel identity.
+- persistent supported channel identity.
 
 **Expected behavior**
 
@@ -799,16 +798,18 @@ booking.
 The system must:
 
 - collect the Contact's name;
-- collect their mobile phone;
-- verify that the mobile phone belongs to the Contact;
 - create a persistent Customer record;
-- associate the verified mobile phone with that Customer;
-- associate the active WhatsApp channel identity with that Customer.
+- associate the active channel identity with that Customer.
+
+The assistant may request a contact phone during registration or booking and may
+persist it when provided. A phone number is optional: refusal or failure to
+provide one must not prevent registration or Appointment creation. Mobile
+ownership verification is not required for V1 Appointment creation.
 
 Once registration succeeds, the Appointment flow may continue without requiring
 the Customer to restart the Conversation or repeat information already provided.
 
-When the active WhatsApp identity already belongs to an existing Customer, the
+When the active channel identity already belongs to an existing Customer, the
 system must reuse that Customer and must not require registration again.
 
 Customer registration does not require a password, email address, login account
@@ -816,14 +817,12 @@ or self-service Customer area.
 
 **Alternative cases**
 
-- the WhatsApp identity already belongs to an existing Customer;
-- the provided mobile phone is already associated with an existing Customer;
-- the Contact abandons registration;
-- mobile verification cannot be completed.
+- the channel identity already belongs to an existing Customer;
+- the Contact declines to provide a phone number;
+- the Contact abandons registration.
 
 **Relevant errors**
 
-- mobile verification fails;
 - Customer registration cannot be completed;
 - Customer data cannot be persisted;
 - temporary system failure.
@@ -845,14 +844,18 @@ must not be inferred by the conversational assistant.
 
 ### BR-02 — Service duration
 
-Each Service must have a defined duration used when calculating Appointment
-availability.
+Each Service must have a defined `duration_minutes` and may define non-negative integer
+`buffer_before_minutes` and `buffer_after_minutes` as Business scheduling
+configuration. Each buffer defaults to zero when not configured.
 
 The duration of an Appointment is determined by the selected Service and must not
 be estimated by the conversational assistant.
 
-A valid Appointment slot must provide enough continuous Professional availability
-to accommodate the complete Service duration.
+The duration remains the Customer-facing Appointment duration. The complete
+scheduling occupancy is the before buffer plus Service duration plus the after
+buffer. Buffers consume Professional scheduling capacity without changing the
+Customer-facing duration. A valid Appointment slot must fit the complete occupancy
+within continuous valid Professional availability.
 
 ### BR-03 — Professional availability
 
@@ -872,8 +875,8 @@ Professional availability may include:
 - temporary exceptions;
 - full-day or partial-day blocks.
 
-A Professional may only receive an Appointment when the complete duration of the
-requested Service fits within a continuous available period.
+A Professional may only receive an Appointment when the complete scheduling
+occupancy of the requested Service fits within a continuous available period.
 
 Temporary exceptions and blocked periods take precedence over recurring
 availability.
@@ -893,7 +896,7 @@ At minimum, a valid slot must satisfy the following conditions:
 
 - the requested Service exists and is active;
 - the selected Professional is eligible to provide the requested Service;
-- the complete Service duration fits within the Professional's effective availability;
+- the complete scheduling occupancy, including buffers, fits within the Professional's effective availability;
 - the Appointment does not overlap an existing active Appointment assigned to the same Professional;
 - the slot does not overlap a blocked or unavailable period;
 - the slot satisfies the applicable Business scheduling policies.
@@ -963,17 +966,14 @@ Each registered Customer must have a persistent application identity associated
 with:
 
 - their name;
-- a verified mobile phone;
-- their WhatsApp channel identity.
+- their persistent supported channel identity.
 
-The verified mobile phone and WhatsApp channel identity must resolve to the same
-Customer record.
-
-A WhatsApp channel identity already associated with a Customer must resolve that
+A channel identity already associated with a Customer must resolve that
 Customer in subsequent Conversations.
 
-A verified mobile phone already associated with a Customer must not result in a
-duplicate Customer record.
+A phone number is optional contact data and must not be a mandatory identity key
+or proof of Customer identity. Mobile ownership verification is not required to
+register or create a V1 Appointment.
 
 An Appointment must be associated with the Customer for whom it was created.
 
@@ -1138,7 +1138,7 @@ searched for that Professional.
 The requested Professional may only be selected if they:
 
 - are eligible to provide the requested Service;
-- are available for the complete Appointment duration;
+- are available for the complete scheduling occupancy, including buffers;
 - satisfy all applicable scheduling rules.
 
 If the requested Professional has no valid availability, the system must inform

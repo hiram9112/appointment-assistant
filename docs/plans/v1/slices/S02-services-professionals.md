@@ -1,6 +1,6 @@
 # S02 — Services and Professionals
 
-**Status:** Active  
+**Status:** Done  
 **Depends on:** S01  
 **Covers:** FR-02; BR-01; BR-02
 

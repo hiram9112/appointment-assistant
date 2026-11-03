@@ -39,21 +39,23 @@ class BusinessSeeder extends Seeder
         }
 
         $services = [
-            ['Initial beauty consultation', 30, '0.00'],
-            ['Deep facial cleansing', 60, '55.00'],
-            ['Hydrating facial treatment', 60, '65.00'],
-            ['Premium facial treatment', 90, '85.00'],
-            ['Laser hair removal — underarms', 20, '25.00'],
-            ['Laser hair removal — full legs', 45, '65.00'],
-            ['Firming body treatment', 60, '70.00'],
-            ['Wellness massage', 60, '50.00'],
+            ['Initial beauty consultation', 30, '0.00', 0, 0],
+            ['Deep facial cleansing', 60, '55.00', 5, 10],
+            ['Hydrating facial treatment', 60, '65.00', 5, 10],
+            ['Premium facial treatment', 90, '85.00', 10, 10],
+            ['Laser hair removal — underarms', 20, '25.00', 5, 5],
+            ['Laser hair removal — full legs', 45, '65.00', 5, 10],
+            ['Firming body treatment', 60, '70.00', 5, 10],
+            ['Wellness massage', 60, '50.00', 5, 10],
         ];
 
         $serviceIds = [];
-        foreach ($services as [$name, $duration, $price]) {
+        foreach ($services as [$name, $duration, $price, $bufferBefore, $bufferAfter]) {
             $serviceIds[$name] = $business->services()->updateOrCreate(['name' => $name], [
                 'description' => null,
                 'duration_minutes' => $duration,
+                'buffer_before_minutes' => $bufferBefore,
+                'buffer_after_minutes' => $bufferAfter,
                 'price_amount' => $price,
                 'currency_code' => 'EUR',
                 'active' => true,
