@@ -112,7 +112,8 @@ Customer record in the application.
 
 A Customer has:
 
-- name;
+- first name;
+- at least one surname;
 - an associated persistent supported channel identity;
 - optional phone contact data.
 
@@ -786,7 +787,8 @@ registration before a real Business Appointment can be created.
 
 **Required information**
 
-- name;
+- first name;
+- at least one surname;
 - persistent supported channel identity.
 
 **Expected behavior**
@@ -797,7 +799,7 @@ booking.
 
 The system must:
 
-- collect the Contact's name;
+- collect the Contact's first name and at least one surname;
 - create a persistent Customer record;
 - associate the active channel identity with that Customer.
 
@@ -965,7 +967,7 @@ associated with real Business Customers.
 Each registered Customer must have a persistent application identity associated
 with:
 
-- their name;
+- their first name and at least one surname;
 - their persistent supported channel identity.
 
 A channel identity already associated with a Customer must resolve that
