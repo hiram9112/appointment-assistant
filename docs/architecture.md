@@ -252,22 +252,19 @@ Laravel is the common security boundary for application operations.
 Different V1 interfaces establish identity using mechanisms appropriate to their
 context.
 
-For the real WhatsApp channel, Appointment management requires a registered
-Customer with a persistent application identity.
+For real Business interaction channels, Appointment management requires a registered Customer with a persistent application identity.
 
 A registered Customer is associated with:
 
-- their name and the persistent channel identity supplied by the supported real channel;
-- optional phone contact data, when provided.
+- a name;
+- a persistent supported channel identity;
+- optional phone contact data.
 
-The WhatsApp channel identity is used to resolve the same Customer across
-subsequent Conversations.
+The channel identity is used to resolve the same Customer across subsequent Conversations.
 
-Phone numbers are optional contact data, not mandatory authentication evidence;
-phone verification is not an application boundary for Appointment creation.
+A phone number is not a mandatory identity key, and mobile ownership verification is not required for V1 Customer registration or Appointment creation.
 
-Customer identity is owned by the Laravel application and must not depend
-exclusively on Conversation state or the AI layer.
+Customer identity is owned by the Laravel application and persists independently from Conversations and Appointments. It must not depend exclusively on Conversation state or the AI layer.
 
 The public demo uses isolated temporary demo identities so that visitors can
 exercise Appointment capabilities without creating real Business Customers.

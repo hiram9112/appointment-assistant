@@ -1,6 +1,6 @@
 # S03 — Appointment availability
 
-**Status:** Active  
+**Status:** Done  
 **Depends on:** S02  
 **Covers:** FR-03; BR-01; BR-02; BR-03; BR-04; BR-05; BR-13
 
