@@ -35,4 +35,9 @@ class Professional extends Model
     {
         return $this->hasMany(ScheduleException::class);
     }
+
+    public function appointments(): HasMany
+    {
+        return $this->hasMany(Appointment::class);
+    }
 }

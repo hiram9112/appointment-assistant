@@ -1,6 +1,6 @@
 # S04 — Customer registration and identity
 
-**Status:** Active  
+**Status:** Done  
 **Depends on:** Milestone 1  
 **Covers:** FR-14; BR-07
 
