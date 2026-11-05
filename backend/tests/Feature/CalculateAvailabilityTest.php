@@ -20,6 +20,13 @@ class CalculateAvailabilityTest extends TestCase
 {
     use RefreshDatabase;
 
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        $this->travelTo(new DateTimeImmutable('2026-11-01 00:00 UTC'));
+    }
+
     public function test_duration_and_both_buffers_produce_inclusive_start_ranges(): void
     {
         [$business, $service, $professional] = $this->schedule(['duration_minutes' => 60, 'buffer_before_minutes' => 10, 'buffer_after_minutes' => 20]);

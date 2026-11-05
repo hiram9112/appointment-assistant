@@ -23,6 +23,13 @@ class AppointmentAvailabilityCapabilityTest extends TestCase
 {
     use RefreshDatabase;
 
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        $this->travelTo(new DateTimeImmutable('2026-11-01 00:00 UTC'));
+    }
+
     public function test_available_choices_are_neutrally_ordered_and_contain_calculated_ranges(): void
     {
         [$business, $service] = $this->schedule();

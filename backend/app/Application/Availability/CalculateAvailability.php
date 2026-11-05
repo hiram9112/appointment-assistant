@@ -32,6 +32,17 @@ final class CalculateAvailability
         $utc = new DateTimeZone('UTC');
         $from = $from->setTimezone($utc);
         $to = $to->setTimezone($utc);
+        $earliestAllowedStart = DateTimeImmutable::createFromInterface(now())->setTimezone($utc)->modify('+2 minutes');
+        if ($earliestAllowedStart->format('s.u') !== '00.000000') {
+            $earliestAllowedStart = $earliestAllowedStart->setTime(
+                (int) $earliestAllowedStart->format('H'),
+                (int) $earliestAllowedStart->format('i'),
+            )->modify('+1 minute');
+        }
+        $from = max($from, $earliestAllowedStart);
+        if ($from > $to) {
+            return [];
+        }
         $before = $service->buffer_before_minutes;
         $after = $service->duration_minutes + $service->buffer_after_minutes;
         $period = new TimeInterval($from->modify("-{$before} minutes"), $to->modify("+{$after} minutes"));
