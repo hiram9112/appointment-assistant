@@ -79,7 +79,9 @@ The following capabilities are intentionally outside the V1 scope:
 - Business configuration through a graphical interface;
 - voice interaction;
 - multi-Business or SaaS capabilities;
-- payments;
+- payments, including deposits, advance payments and online payment collection;
+- financial penalties and payment-dependent booking restrictions;
+- Customer scoring, automatic restrictions and administrative incident management;
 - advanced analytics;
 - retrieval-augmented knowledge capabilities;
 - Customer passwords, login credentials or self-service account areas;
@@ -182,12 +184,16 @@ Each Professional has configurable information including:
 Business-level scheduling policies may include:
 
 - Professional selection behavior;
-- cancellation and rescheduling rules, including any minimum notice period;
+- independent recommended cancellation and rescheduling notice periods;
 - whether Customer reminders are enabled;
 - reminder timing when reminders are enabled.
 
 Business configuration values are application data and must not be embedded in
 conversational prompts or application source code.
+
+The `cancellation_notice_minutes` and `rescheduling_notice_minutes` values are
+advisory in V1, not minimum notice restrictions. The application enforces the
+other applicable scheduling, identity, ownership and lifecycle rules.
 
 The mechanism used to manage this configuration is outside the V1 scope. During
 V1, configuration may be initialized through application or deployment data.
@@ -454,9 +460,14 @@ The system identifies the existing Appointment and determines valid alternatives
 according to the same availability and scheduling rules used for new
 Appointments.
 
-Before applying the change, the system must verify that rescheduling is
-permitted under the applicable Business policy and that the new slot is still
-available and satisfies all applicable scheduling rules.
+Before applying the change, the system must verify Customer identity and
+ownership, a future confirmed Appointment, and that the new slot is still
+available and satisfies all applicable scheduling rules, including Professional
+eligibility, buffers and concurrency protection.
+
+A valid rescheduling is permitted inside the recommended notice period. A
+successful late rescheduling records the breach in its Appointment audit; a
+failed operation records no late-notice incident.
 
 The existing Appointment must remain valid until the rescheduling operation has
 successfully completed.
@@ -493,8 +504,12 @@ The Customer can cancel an existing Appointment.
 
 **Expected behavior**
 
-The system identifies the Appointment, verifies that cancellation is permitted
-under the applicable Business rules and cancels it.
+The system identifies the Customer and their future confirmed Appointment,
+verifies the applicable rules and cancels it. A valid cancellation is permitted
+inside the recommended notice period; a successful late cancellation records
+the breach in its Appointment audit. A failed cancellation records no
+late-notice incident. Cancellation preserves the Appointment and immediately
+releases scheduling occupancy.
 
 The Customer receives explicit confirmation only after the cancellation has been
 successfully completed.
@@ -668,8 +683,8 @@ state.
 
 **Expected behavior**
 
-Every Appointment creation, rescheduling, Professional reassignment or
-cancellation must produce an audit record.
+Every Appointment creation, rescheduling, Professional reassignment,
+cancellation, completion or no-show transition must produce an audit record.
 
 Each audit record must identify, when applicable:
 
@@ -686,6 +701,9 @@ channels or administrative operations can be distinguished without changing the
 Appointment domain.
 
 Audit history must remain available when an Appointment is cancelled.
+
+The normal audit record for a successful late cancellation or rescheduling
+contains the structured `late_notice` indication described in BR-14.
 
 Audit records must not be silently modified or removed through normal Appointment
 operations.
@@ -940,14 +958,16 @@ At minimum, the system must support:
 
 - confirmed;
 - cancelled;
-- completed.
+- completed;
+- no_show.
 
 Only confirmed Appointments occupy scheduling availability.
 
-A cancelled Appointment must no longer block the Professional's availability.
-
-A completed Appointment must remain part of the Business history but must not be
-modifiable through normal rescheduling or cancellation operations.
+`no_show` means that the Customer did not attend, unlike `cancelled`, which
+means the Appointment was explicitly cancelled. Cancelled, completed and
+no-show Appointments remain persisted as Business history and do not occupy
+scheduling availability. Completed and no-show are terminal states and cannot
+be modified through normal Customer rescheduling or cancellation operations.
 
 An Appointment may only transition between states allowed by the product rules.
 
@@ -956,6 +976,10 @@ than physically deleting it.
 
 Appointment state changes must be performed by the application and must not be
 inferred or applied directly by the conversational assistant.
+The transition to `no_show` must be performed by an authorized Laravel application
+capability and recorded in the append-only Appointment audit. Passing the scheduled
+end time, or the absence of attendance confirmation, is not proof of attendance
+or non-attendance and must not automatically produce `completed` or `no_show`.
 
 ### BR-07 — Customer identity, ownership and access
 
@@ -1013,30 +1037,27 @@ A successful rescheduling must:
 - produce the corresponding audit record;
 - trigger the applicable schedule synchronization and Professional notification.
 
-Rescheduling may be restricted by configurable Business rules, including a
-minimum notice period.
-
-If rescheduling is not permitted under the configured policy, the existing
-Appointment must remain unchanged and the Customer must be clearly informed.
+The configured rescheduling notice period is advisory in V1. A valid
+rescheduling remains permitted with less notice, and its audit must record a
+late-notice indication as specified in BR-14. If another applicable rule prevents
+rescheduling, the existing Appointment and audit history must remain unchanged
+and the Customer must be clearly informed.
 
 Rescheduling consistency must be enforced by the application and must not depend
 on the conversational assistant.
 
 ### BR-09 — Cancellation policy
 
-The Business may define rules that determine when a confirmed Appointment can be
-cancelled.
-
-Cancellation rules may include:
-
-- a minimum notice period before the Appointment starts;
-- cases where cancellation is no longer permitted through the Customer-facing conversational flow;
-- Business-specific exceptions when applicable.
+The Business may configure a recommended cancellation notice period. In V1 it
+is advisory: a valid cancellation of a future confirmed Appointment remains
+permitted with less notice, and its audit must record a late-notice indication
+as specified in BR-14. Identity, ownership and lifecycle restrictions remain
+mandatory.
 
 If cancellation is permitted, the Appointment must transition to the cancelled
 state and must immediately stop occupying Professional availability.
 
-If cancellation is not permitted under the configured policy, the system must not
+If cancellation is not permitted under another applicable rule, the system must not
 cancel the Appointment and must clearly inform the Customer that the request
 cannot be completed under the current Business rules.
 
@@ -1050,8 +1071,8 @@ Cancelling an Appointment must preserve:
 Cancellation must trigger the applicable Business schedule synchronization and
 Professional notification.
 
-Cancellation rules must be defined by Business configuration and enforced by the
-application, not by the conversational assistant.
+The notice recommendation is Business configuration; applicable cancellation
+rules must be enforced by the application, not by the conversational assistant.
 
 ### BR-10 — Appointment confirmation and side effects
 
@@ -1169,7 +1190,9 @@ At minimum, the audit history must record Appointment:
 - creation;
 - rescheduling;
 - Professional reassignment;
-- cancellation.
+- cancellation;
+- completion;
+- no-show transitions.
 
 Each audit record must preserve enough information to determine:
 
@@ -1187,7 +1210,30 @@ A later Appointment change must create a new audit record rather than replacing
 or rewriting previous history.
 
 Audit history must remain associated with the Appointment throughout its
-lifecycle, including after cancellation or completion.
+lifecycle, including after cancellation, completion or no-show.
+
+The existing `AppointmentAudit` is the source of truth for late-notice
+incidents. The planned `appointment_audits.late_notice` boolean, implemented in
+S07 and reused in S08, marks the normal audit record of a successful cancellation
+or rescheduling when it breached the applicable recommendation. Only such
+successful late operations have `late_notice` set to true; all other audit
+records do not. It does not replace existing audit information or require a
+separate incident record.
+
+Evaluate notice against the original Appointment start instant, the applicable
+configured notice period and the operation time. An operation exactly at the
+recommended boundary is compliant; less notice is late. A compliant operation
+still has its normal audit record but no late-notice incident. A failed operation
+must not produce a late-notice incident. The operation and its corresponding audit
+record must be persisted atomically.
+
+Customer late-change counts are derived from associated Appointment audit
+history; Customer no-shows are separately derived from Appointments with
+`status = no_show`. These are distinct Business facts. No Customer counter or
+separate incident ledger is persisted. Future administration may use these facts
+to identify repeated late changes or no-shows and apply Business policies, such
+as possible advance-payment requirements; administration, notifications, scoring
+and payment enforcement for these incidents are outside V1.
 
 All authorized interfaces that can modify Appointment state must participate in
 the same audit mechanism.

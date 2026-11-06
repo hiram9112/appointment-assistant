@@ -209,9 +209,11 @@ A valid Appointment requires:
 
 ### Cancellation and rescheduling
 
-Cancellation or rescheduling is permitted only when requested at least **24 hours before the Appointment start time**.
+The recommended cancellation notice is **24 hours**, and the independent recommended rescheduling notice is also **24 hours**. Both are advisory in V1: otherwise valid cancellations and rescheduling remain permitted with less notice.
 
-Requests made less than 24 hours before the Appointment are not permitted by the Business cancellation policy.
+A successful operation performed less than 24 hours before the original Appointment start generates a late-notice indication in its AppointmentAudit. An operation at least 24 hours in advance generates no late-notice incident; a failed operation generates none.
+
+No deposits, advance payments or financial penalties apply in V1.
 
 ### Customer reminders
 
@@ -319,7 +321,7 @@ The Initial beauty consultation lasts 30 minutes and costs €0.
 
 ### When can I cancel or reschedule?
 
-Cancellation or rescheduling is allowed until 24 hours before the Appointment.
+Please give at least 24 hours' notice when cancelling or rescheduling. Otherwise valid changes are still allowed with less notice.
 
 ### Will I receive a reminder?
 
