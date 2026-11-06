@@ -1,6 +1,6 @@
 # S05 — Create Appointment
 
-**Status:** Active  
+**Status:** Done  
 **Depends on:** S03, S04  
 **Covers:** FR-04; FR-11; BR-04; BR-05; BR-06; BR-07; BR-10; BR-13; BR-14
 
