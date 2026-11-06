@@ -82,21 +82,23 @@ Cancelled and completed Appointments remain persistent historical records.
 
 State transitions belong to later slices. S05 does not implement cancellation, rescheduling or completion operations.
 
-### Future-time validation
+### Start-time safety margin
 
-Appointment creation requires `starts_at` to be strictly later than the current instant.
+Obtain the current instant in UTC, add exactly two minutes, and round up to the next whole minute if seconds or microseconds are non-zero. An Appointment start must be at or after this threshold.
 
-Same-day booking is allowed when the requested start time is still in the future.
+For example, `12:00:00` yields `12:02:00`, while `12:00:35` and `12:00:59` both yield `12:03:00`.
 
-Past or current start times must be rejected, regardless of apparent schedule availability.
+Same-day booking is allowed at or after the threshold.
+
+Starts before the threshold must be rejected, regardless of apparent schedule availability.
 
 Use a testable application clock or established Laravel time-testing conventions.
 
-The S03 availability capability must not present past Appointment start times as bookable.
+The same policy applies to S03 availability and Appointment creation.
 
 When connecting S03 to persisted occupancy, verify whether this protection already exists and add only the missing behavior and tests.
 
-Do not introduce a configurable minimum booking lead time without an applicable Business rule.
+Do not introduce a fixed booking grid or make the margin configurable in S05.
 
 ### PostgreSQL concurrency protection
 
@@ -213,7 +215,7 @@ It validates:
 - Service existence, active state and Business association;
 - Professional existence and Business association;
 - Professional-Service eligibility;
-- future Appointment start time;
+- Appointment start at or after the safety threshold;
 - complete Appointment occupancy validity through S03;
 - currently available scheduling capacity.
 
@@ -358,10 +360,10 @@ Derive occupied intervals from stored start, end and buffer values.
 
 Preserve the existing S03 calculation and application capability conventions.
 
-Verify the previously identified future-time rule:
+Verify the approved start-time safety policy:
 
-- availability queries must not expose past Appointment starts as bookable;
-- bookings later today remain possible when their start is in the future.
+- availability queries must not expose starts before the threshold as bookable;
+- bookings later today remain possible when their start meets the threshold.
 
 Implement only the missing adjustment, if any.
 
@@ -378,8 +380,8 @@ Do not introduce new Appointment creation or lifecycle behavior in this task.
 - cancelled and completed Appointments do not block availability;
 - an interval starting before the requested period is included when it overlaps;
 - adjacent intervals do not produce false conflicts;
-- queries do not expose past starts as bookable;
-- same-day future availability remains available when otherwise valid;
+- queries do not expose starts before the threshold as bookable;
+- same-day availability at or after the threshold remains available when otherwise valid;
 - the existing S03 scheduling algorithm and its controlled test boundaries remain usable.
 
 ## Tests
@@ -398,8 +400,8 @@ Cover at least:
 10. adjacent non-overlapping intervals;
 11. past-day availability request;
 12. same-day past time;
-13. exactly current time;
-14. same-day future availability;
+13. exactly current time and starts immediately before and at the rounded safety threshold;
+14. same-day availability at and after the threshold, including off-grid starts;
 15. existing S03 availability tests remain green.
 
 Do not implement Task 3 as part of this task.
@@ -503,7 +505,7 @@ Use the current Service configuration to derive:
 - after buffer;
 - complete requested scheduling occupancy.
 
-Require the requested start time to be strictly in the future.
+Require the requested start to meet the shared two-minute, whole-minute-rounded safety threshold through S03 revalidation.
 
 Revalidate the requested start through the S03 availability calculation, using the authoritative PostgreSQL occupancy source from Task 2.
 
@@ -535,8 +537,8 @@ Do not add conversational response generation, external side effects or HTTP int
 - ineligible Professionals are rejected;
 - the explicitly selected Professional is preserved;
 - Appointment creation without a selected Professional fails;
-- start times in the past or exactly at the current instant are rejected;
-- valid future start times are supported;
+- start times before the safety threshold are rejected;
+- valid starts at or after the threshold are supported without a fixed grid;
 - Service duration and buffers come from current authoritative configuration;
 - final availability revalidation includes Business hours, Professional availability, exceptions, buffers and persisted occupancy;
 - a previously available slot may fail safely when scheduling state changes;
@@ -563,8 +565,8 @@ Cover at least:
 7. ineligible Professional;
 8. missing Professional selection;
 9. past Appointment start;
-10. Appointment start equal to current instant;
-11. valid future Appointment start;
+10. Appointment starts before and exactly at the threshold, including clocks with seconds and microseconds;
+11. valid starts at or after the threshold, including off-grid starts;
 12. derived end time and persisted buffers;
 13. Business operating-hours boundary;
 14. Professional availability and recurring breaks;
@@ -592,7 +594,7 @@ S05 is complete when:
 - Appointment lifecycle states are represented, with only `confirmed` occupying scheduling capacity;
 - PostgreSQL prevents overlapping confirmed Professional occupancy under concurrent writes;
 - persisted confirmed Appointments supply the authoritative occupancy consumed by S03;
-- past Appointment starts cannot be booked or presented as bookable;
+- starts before the shared safety threshold cannot be booked or presented as bookable;
 - `CreateAppointment` validates current Service, Professional and scheduling rules without duplicating S03 logic;
 - an explicitly selected Professional is never silently replaced;
 - a successful creation atomically persists the confirmed Appointment and its audit record;
