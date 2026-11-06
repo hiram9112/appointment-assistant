@@ -38,6 +38,7 @@ class AppointmentOccupancyIntegrationTest extends TestCase
         $this->appointment($service, $other, '15:00', '16:00');
         $this->appointment($service, $professional, '15:00', '16:00', ['status' => 'cancelled']);
         $this->appointment($service, $professional, '16:00', '17:00', ['status' => 'completed']);
+        $this->appointment($service, $professional, '14:00', '15:00', ['status' => 'no_show']);
 
         $this->assertInstanceOf(PostgresAppointmentOccupancy::class, app(AppointmentOccupancy::class));
         $this->assertSame([['09:00', '09:00'], ['11:00', '12:00'], ['14:00', '16:00']], $this->ranges($business, $service, $professional));

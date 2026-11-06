@@ -16,7 +16,7 @@ class AppointmentAudit extends Model
 
     protected $dateFormat = 'Y-m-d H:i:sP';
 
-    protected $fillable = ['appointment_id', 'action', 'actor_type', 'actor_id', 'source', 'before_state', 'after_state', 'occurred_at'];
+    protected $fillable = ['appointment_id', 'action', 'actor_type', 'actor_id', 'source', 'before_state', 'after_state', 'occurred_at', 'late_notice'];
 
     protected function casts(): array
     {
@@ -24,6 +24,7 @@ class AppointmentAudit extends Model
             'before_state' => 'array',
             'after_state' => 'array',
             'occurred_at' => 'immutable_datetime',
+            'late_notice' => 'boolean',
         ];
     }
 

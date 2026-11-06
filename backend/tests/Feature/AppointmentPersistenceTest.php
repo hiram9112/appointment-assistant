@@ -175,6 +175,6 @@ class AppointmentPersistenceTest extends TestCase
 
     public static function nonConfirmedStatuses(): array
     {
-        return [['cancelled'], ['completed']];
+        return [['cancelled'], ['completed'], ['no_show']];
     }
 }

@@ -30,6 +30,7 @@ class AppointmentAuditTest extends TestCase
         $this->assertSame('booking-service', $audit->actor_id);
         $this->assertSame('internal', $audit->source);
         $this->assertNull($audit->before_state);
+        $this->assertFalse($audit->late_notice);
         $this->assertSame('2029-12-01T12:00:00.000000Z', $audit->occurred_at->utc()->toJSON());
         $expected = [
             'id' => $appointment->id,
@@ -66,7 +67,36 @@ class AppointmentAuditTest extends TestCase
         $this->assertSame('operator', $next->actor_type);
         $this->assertSame('42', $next->actor_id);
         $this->assertSame('console', $next->source);
+        $this->assertFalse($next->fresh()->late_notice);
         $this->assertDatabaseCount('appointment_audits', 2);
+    }
+
+    #[DataProvider('lateNoticeValues')]
+    public function test_late_notice_persists_as_a_boolean(bool $lateNotice): void
+    {
+        $audit = AppointmentAudit::factory()->create(['late_notice' => $lateNotice])->fresh();
+
+        $this->assertSame($lateNotice, $audit->late_notice);
+    }
+
+    public static function lateNoticeValues(): array
+    {
+        return [[true], [false]];
+    }
+
+    public function test_existing_audit_receives_default_when_migration_is_applied(): void
+    {
+        $migration = require database_path('migrations/2026_11_06_160250_align_appointment_status_and_audit_late_notice.php');
+        $migration->down();
+
+        $audit = AppointmentAudit::factory()->create(['before_state' => ['status' => 'confirmed'], 'after_state' => ['status' => 'cancelled']]);
+        $migration->up();
+
+        $audit->refresh();
+        $this->assertFalse($audit->late_notice);
+        $this->assertSame(['status' => 'confirmed'], $audit->before_state);
+        $this->assertSame(['status' => 'cancelled'], $audit->after_state);
+        $this->assertTrue($audit->appointment->audits->contains($audit));
     }
 
     public function test_audit_history_is_ordered_by_action_time_before_id(): void
@@ -112,6 +142,7 @@ class AppointmentAuditTest extends TestCase
             'missing source' => ['source', null, '23502'],
             'missing after state' => ['after_state', null, '23502'],
             'missing timestamp' => ['occurred_at', null, '23502'],
+            'missing late notice' => ['late_notice', null, '23502'],
         ];
     }
 }
