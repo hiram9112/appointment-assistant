@@ -143,6 +143,22 @@ class RescheduleAppointmentConcurrencyTest extends TestCase
         });
     }
 
+    public function test_concurrent_attendance_outcomes_only_transition_once(): void
+    {
+        $this->withCommittedSchedule(function ($business, $customer, $service, $professional, $first): void {
+            $this->runRace($business, $customer, $service, $professional, [
+                ['attendance', $first->id, 'completed', '2026-11-09 10:00 UTC'],
+                ['attendance', $first->id, 'no_show', '2026-11-09 10:00 UTC'],
+            ], false, function ($db) use ($first): void {
+                $this->assertSame('completed', $db->table('appointments')->where('id', $first->id)->value('status'));
+                $audits = $db->table('appointment_audits')->where('appointment_id', $first->id)->get();
+                $this->assertCount(2, $audits);
+                $this->assertCount(1, $audits->where('action', 'completed'));
+                $this->assertCount(0, $audits->where('action', 'no_show'));
+            });
+        });
+    }
+
     private function withCommittedSchedule(callable $test): void
     {
         $default = DB::getDefaultConnection();
@@ -222,6 +238,8 @@ class RescheduleAppointmentConcurrencyTest extends TestCase
                     $result = (new App\Application\Appointment\CreateAppointment($availability, $audit))->handle($business, (int) $argv[2], (int) $argv[3], (int) $argv[4], new DateTimeImmutable($argv[7]), 'system', 'race', 'test');
                 } elseif ($argv[5] === 'cancel') {
                     $result = (new App\Application\Appointment\CancelAppointment($audit))->handle($business, (int) $argv[2], (int) $argv[6], 'system', 'race', 'test');
+                } elseif ($argv[5] === 'attendance') {
+                    $result = (new App\Application\Appointment\RecordAppointmentAttendance($audit))->handle($business, (int) $argv[6], $argv[7], 'system', 'race', 'test');
                 } else {
                     $result = (new App\Application\Appointment\RescheduleAppointment($availability, $audit))->handle($business, (int) $argv[2], (int) $argv[6], new DateTimeImmutable($argv[7]), null, 'system', 'race', 'test');
                 }
