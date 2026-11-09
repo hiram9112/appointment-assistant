@@ -8,6 +8,7 @@ use App\Models\Service;
 use DateTimeImmutable;
 use DateTimeZone;
 use InvalidArgumentException;
+use LogicException;
 
 final class CalculateAvailability
 {
@@ -20,6 +21,26 @@ final class CalculateAvailability
      * @return list<AppointmentStartRange>
      */
     public function handle(Business $business, Service $service, Professional $professional, DateTimeImmutable $from, DateTimeImmutable $to): array
+    {
+        return $this->calculate($business, $service, $professional, $from, $to, null);
+    }
+
+    /**
+     * Only a trusted caller that has validated the original Appointment may use this path.
+     *
+     * @return list<AppointmentStartRange>
+     */
+    public function forRescheduling(Business $business, Service $service, Professional $professional, DateTimeImmutable $from, DateTimeImmutable $to, int $appointmentId): array
+    {
+        if (! $this->occupancy instanceof ReschedulingAppointmentOccupancy) {
+            throw new LogicException('The occupancy source does not support rescheduling exclusions.');
+        }
+
+        return $this->calculate($business, $service, $professional, $from, $to, $appointmentId);
+    }
+
+    /** @return list<AppointmentStartRange> */
+    private function calculate(Business $business, Service $service, Professional $professional, DateTimeImmutable $from, DateTimeImmutable $to, ?int $appointmentId): array
     {
         if ($from > $to) {
             throw new InvalidArgumentException('The requested start range is reversed.');
@@ -93,7 +114,16 @@ final class CalculateAvailability
             }
         }
 
-        $effective = $this->subtract($this->merge($effective), $this->merge([...$blocked, ...$this->occupancy->forProfessional($professional, $period)]));
+        if ($appointmentId === null) {
+            $occupied = $this->occupancy->forProfessional($professional, $period);
+        } else {
+            if (! $this->occupancy instanceof ReschedulingAppointmentOccupancy) {
+                throw new LogicException('The occupancy source does not support rescheduling exclusions.');
+            }
+
+            $occupied = $this->occupancy->forProfessionalExcludingAppointment($professional, $period, $appointmentId);
+        }
+        $effective = $this->subtract($this->merge($effective), $this->merge([...$blocked, ...$occupied]));
         $ranges = [];
         foreach ($effective as $interval) {
             $earliest = max($from, $interval->start->modify("+{$before} minutes"));

@@ -3,6 +3,7 @@
 namespace Tests\Feature;
 
 use App\Application\Availability\AppointmentOccupancy;
+use App\Application\Availability\CalculateAvailability;
 use App\Application\Availability\GetAppointmentAvailability;
 use App\Application\Availability\PostgresAppointmentOccupancy;
 use App\Application\Availability\TimeInterval;
@@ -11,6 +12,7 @@ use App\Models\Business;
 use App\Models\BusinessOperatingHour;
 use App\Models\Professional;
 use App\Models\ProfessionalAvailabilityInterval;
+use App\Models\ScheduleException;
 use App\Models\Service;
 use DateTimeImmutable;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -85,6 +87,56 @@ class AppointmentOccupancyIntegrationTest extends TestCase
         $this->appointment($service, $professional, '10:00', '11:00');
 
         $this->assertSame([['09:00', '09:00'], ['11:00', '16:00']], $this->ranges($business, $service, $professional));
+    }
+
+    public function test_rescheduling_excludes_only_the_original_without_changing_it(): void
+    {
+        [$business, $service, $professional] = $this->schedule();
+        $original = $this->appointment($service, $professional, '10:00', '11:00');
+        $this->appointment($service, $professional, '12:00', '13:00');
+
+        $this->assertSame([], $this->ranges($business, $service, $professional, '2026-11-09 10:30 UTC', '2026-11-09 10:30 UTC'));
+        $this->assertTrue($this->replacementAvailable($business, $service, $professional, $original, '10:30'));
+        $this->assertFalse($this->replacementAvailable($business, $service, $professional, $original, '11:30'));
+        $this->assertTrue($this->replacementAvailable($business, $service, $professional, $original, '11:00'));
+        $this->assertTrue($this->replacementAvailable($business, $service, $professional, $original, '13:00'));
+        $this->assertDatabaseHas('appointments', ['id' => $original->id, 'status' => 'confirmed']);
+        $this->assertSame('10:00', $original->fresh()->starts_at->utc()->format('H:i'));
+        $this->assertSame('11:00', $original->fresh()->ends_at->utc()->format('H:i'));
+        $this->assertSame([], $this->ranges($business, $service, $professional, '2026-11-09 10:30 UTC', '2026-11-09 10:30 UTC'));
+    }
+
+    public function test_rescheduling_uses_current_service_duration_and_buffers(): void
+    {
+        [$business, $service, $professional] = $this->schedule();
+        $original = $this->appointment($service, $professional, '10:00', '11:00');
+        $this->appointment($service, $professional, '12:00', '13:00');
+
+        $this->assertTrue($this->replacementAvailable($business, $service, $professional, $original, '11:00'));
+        $service->update(['duration_minutes' => 61]);
+        $this->assertFalse($this->replacementAvailable($business, $service, $professional, $original, '11:00'));
+        $service->update(['duration_minutes' => 60, 'buffer_after_minutes' => 1]);
+        $this->assertFalse($this->replacementAvailable($business, $service, $professional, $original, '11:00'));
+        $service->update(['buffer_after_minutes' => 0, 'buffer_before_minutes' => 1]);
+        $this->assertFalse($this->replacementAvailable($business, $service, $professional, $original, '13:00'));
+        $this->assertTrue($this->replacementAvailable($business, $service, $professional, $original, '13:01'));
+    }
+
+    public function test_rescheduling_still_enforces_schedules_exceptions_eligibility_and_safety_margin(): void
+    {
+        [$business, $service, $professional] = $this->schedule();
+        $original = $this->appointment($service, $professional, '10:00', '11:00');
+        ScheduleException::factory()->for($business)->create(['professional_id' => $professional->id, 'kind' => 'blocked', 'starts_at' => '2026-11-09 10:30:00', 'ends_at' => '2026-11-09 11:00:00']);
+        $this->assertFalse($this->replacementAvailable($business, $service, $professional, $original, '10:00'));
+        $this->assertFalse($this->replacementAvailable($business, $service, $professional, $original, '08:30'));
+        $professional->availabilityIntervals()->update(['ends_at' => '15:00']);
+        $this->assertFalse($this->replacementAvailable($business, $service, $professional, $original, '14:30'));
+        $professional->services()->detach($service);
+        $this->assertFalse($this->replacementAvailable($business, $service, $professional, $original, '12:00'));
+        $professional->services()->attach($service);
+        $this->travelTo(new DateTimeImmutable('2026-11-09 11:58:15 UTC'));
+        $this->assertFalse($this->replacementAvailable($business, $service, $professional, $original, '12:00'));
+        $this->assertTrue($this->replacementAvailable($business, $service, $professional, $original, '12:01'));
     }
 
     #[DataProvider('pastAndPresentRanges')]
@@ -168,14 +220,21 @@ class AppointmentOccupancyIntegrationTest extends TestCase
         return [$business, $service, $professional];
     }
 
-    private function appointment(Service $service, Professional $professional, string $start, string $end, array $attributes = []): void
+    private function appointment(Service $service, Professional $professional, string $start, string $end, array $attributes = []): Appointment
     {
-        Appointment::factory()->create(array_merge([
+        return Appointment::factory()->create(array_merge([
             'service_id' => $service->id,
             'professional_id' => $professional->id,
             'starts_at' => "2026-11-09 $start:00+00",
             'ends_at' => "2026-11-09 $end:00+00",
         ], $attributes));
+    }
+
+    private function replacementAvailable(Business $business, Service $service, Professional $professional, Appointment $original, string $time): bool
+    {
+        $start = new DateTimeImmutable("2026-11-09 $time UTC");
+
+        return app(CalculateAvailability::class)->forRescheduling($business, $service, $professional, $start, $start, $original->id) !== [];
     }
 
     private function ranges(Business $business, Service $service, Professional $professional, string $from = '2026-11-09 08:00 UTC', string $to = '2026-11-09 19:00 UTC'): array

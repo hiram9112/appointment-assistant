@@ -4,6 +4,7 @@ namespace Tests\Feature;
 
 use App\Application\Availability\AppointmentOccupancy;
 use App\Application\Availability\CalculateAvailability;
+use App\Application\Availability\ReschedulingAppointmentOccupancy;
 use App\Application\Availability\TimeInterval;
 use App\Models\Business;
 use App\Models\BusinessOperatingHour;
@@ -14,6 +15,7 @@ use App\Models\Service;
 use DateTimeImmutable;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use InvalidArgumentException;
+use LogicException;
 use Tests\TestCase;
 
 class CalculateAvailabilityTest extends TestCase
@@ -181,6 +183,50 @@ class CalculateAvailabilityTest extends TestCase
         $this->assertTrue($professional->is($source->professional));
         $this->assertSame('2026-11-09 09:45', $source->period->start->format('Y-m-d H:i'));
         $this->assertSame('2026-11-09 12:20', $source->period->end->format('Y-m-d H:i'));
+    }
+
+    public function test_rescheduling_passes_the_original_id_to_an_exclusion_aware_occupancy_source(): void
+    {
+        [$business, $service, $professional] = $this->schedule();
+        $source = new class implements ReschedulingAppointmentOccupancy
+        {
+            public ?int $excludedId = null;
+
+            public function forProfessional(Professional $professional, TimeInterval $period): array
+            {
+                return [new TimeInterval(new DateTimeImmutable('2026-11-09 10:00 UTC'), new DateTimeImmutable('2026-11-09 11:00 UTC'))];
+            }
+
+            public function forProfessionalExcludingAppointment(Professional $professional, TimeInterval $period, int $appointmentId): array
+            {
+                $this->excludedId = $appointmentId;
+
+                return [];
+            }
+        };
+        $calculator = new CalculateAvailability($source);
+        $start = new DateTimeImmutable('2026-11-09 10:00 UTC');
+
+        $this->assertSame([], $calculator->handle($business, $service, $professional, $start, $start));
+        $this->assertCount(1, $calculator->forRescheduling($business, $service, $professional, $start, $start, 42));
+        $this->assertSame(42, $source->excludedId);
+        $this->assertSame([], $calculator->handle($business, $service, $professional, $start, $start));
+    }
+
+    public function test_rescheduling_fails_closed_when_the_occupancy_source_cannot_exclude_an_appointment(): void
+    {
+        [$business, $service, $professional] = $this->schedule();
+        $source = new class implements AppointmentOccupancy
+        {
+            public function forProfessional(Professional $professional, TimeInterval $period): array
+            {
+                return [];
+            }
+        };
+        $start = new DateTimeImmutable('2026-11-09 10:00 UTC');
+
+        $this->expectException(LogicException::class);
+        (new CalculateAvailability($source))->forRescheduling($business, $service, $professional, $start, $start, 42);
     }
 
     public function test_ineligible_inactive_or_other_business_records_return_no_availability(): void

@@ -7,15 +7,26 @@ use App\Models\Professional;
 use DateTimeImmutable;
 use DateTimeZone;
 
-final class PostgresAppointmentOccupancy implements AppointmentOccupancy
+final class PostgresAppointmentOccupancy implements ReschedulingAppointmentOccupancy
 {
     public function forProfessional(Professional $professional, TimeInterval $period): array
+    {
+        return $this->queryOccupancy($professional, $period, null);
+    }
+
+    public function forProfessionalExcludingAppointment(Professional $professional, TimeInterval $period, int $appointmentId): array
+    {
+        return $this->queryOccupancy($professional, $period, $appointmentId);
+    }
+
+    private function queryOccupancy(Professional $professional, TimeInterval $period, ?int $appointmentId): array
     {
         $utc = new DateTimeZone('UTC');
 
         return Appointment::query()
             ->where('professional_id', $professional->id)
             ->where('status', 'confirmed')
+            ->when($appointmentId !== null, fn ($query) => $query->where('id', '<>', $appointmentId))
             ->whereRaw("(starts_at AT TIME ZONE 'UTC') - buffer_before_minutes * interval '1 minute' < ?::timestamp", [$period->end->setTimezone($utc)->format('Y-m-d H:i:s.u')])
             ->whereRaw("(ends_at AT TIME ZONE 'UTC') + buffer_after_minutes * interval '1 minute' > ?::timestamp", [$period->start->setTimezone($utc)->format('Y-m-d H:i:s.u')])
             ->get()
