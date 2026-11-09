@@ -33,7 +33,7 @@ final class AppendAppointmentAudit
      * @param  array<string, mixed>|null  $beforeState
      * @param  array<string, mixed>  $afterState
      */
-    public function handle(Appointment $appointment, string $action, string $actorType, string $actorId, string $source, ?array $beforeState, array $afterState): AppointmentAudit
+    public function handle(Appointment $appointment, string $action, string $actorType, string $actorId, string $source, ?array $beforeState, array $afterState, bool $lateNotice = false, ?\DateTimeInterface $occurredAt = null): AppointmentAudit
     {
         return $appointment->audits()->create([
             'action' => $action,
@@ -42,7 +42,8 @@ final class AppendAppointmentAudit
             'source' => $source,
             'before_state' => $beforeState,
             'after_state' => $afterState,
-            'occurred_at' => now(),
+            'occurred_at' => $occurredAt ?? now(),
+            'late_notice' => $lateNotice,
         ]);
     }
 }
