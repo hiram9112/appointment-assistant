@@ -92,6 +92,57 @@ class RescheduleAppointmentConcurrencyTest extends TestCase
         });
     }
 
+    public function test_concurrent_cancellations_only_transition_once(): void
+    {
+        $this->withCommittedSchedule(function ($business, $customer, $service, $professional, $first): void {
+            $this->runRace($business, $customer, $service, $professional, [
+                ['cancel', $first->id, '', '2026-11-09 08:00 UTC'],
+                ['cancel', $first->id, '', '2026-11-09 08:00 UTC'],
+            ], false, function ($db) use ($first): void {
+                $this->assertSame('cancelled', $db->table('appointments')->where('id', $first->id)->value('status'));
+                $audits = $db->table('appointment_audits')->where('appointment_id', $first->id)->get();
+                $this->assertCount(2, $audits);
+                $this->assertCount(1, $audits->where('action', 'cancelled'));
+            });
+        });
+    }
+
+    public function test_cancellation_waits_for_rescheduling_and_revalidates_the_new_start(): void
+    {
+        $this->withCommittedSchedule(function ($business, $customer, $service, $professional, $first): void {
+            $this->runRace($business, $customer, $service, $professional, [
+                ['reschedule', $first->id, '2026-11-09 09:00 UTC', '2026-11-09 08:00 UTC'],
+                ['cancel', $first->id, '', '2026-11-09 09:30 UTC'],
+            ], false, function ($db) use ($first): void {
+                $appointment = $db->table('appointments')->where('id', $first->id)->first();
+                $this->assertSame('confirmed', $appointment->status);
+                $this->assertSame('09:00', substr($appointment->starts_at, 11, 5));
+                $audits = $db->table('appointment_audits')->where('appointment_id', $first->id)->get();
+                $this->assertCount(2, $audits);
+                $this->assertCount(1, $audits->where('action', 'rescheduled'));
+                $this->assertCount(0, $audits->where('action', 'cancelled'));
+            });
+        });
+    }
+
+    public function test_rescheduling_waits_for_cancellation_and_revalidates_status(): void
+    {
+        $this->withCommittedSchedule(function ($business, $customer, $service, $professional, $first): void {
+            $this->runRace($business, $customer, $service, $professional, [
+                ['cancel', $first->id, '', '2026-11-09 08:00 UTC'],
+                ['reschedule', $first->id, '2026-11-09 12:00 UTC', '2026-11-09 08:00 UTC'],
+            ], false, function ($db) use ($first): void {
+                $appointment = $db->table('appointments')->where('id', $first->id)->first();
+                $this->assertSame('cancelled', $appointment->status);
+                $this->assertSame('10:00', substr($appointment->starts_at, 11, 5));
+                $audits = $db->table('appointment_audits')->where('appointment_id', $first->id)->get();
+                $this->assertCount(2, $audits);
+                $this->assertCount(1, $audits->where('action', 'cancelled'));
+                $this->assertCount(0, $audits->where('action', 'rescheduled'));
+            });
+        });
+    }
+
     private function withCommittedSchedule(callable $test): void
     {
         $default = DB::getDefaultConnection();
@@ -169,6 +220,8 @@ class RescheduleAppointmentConcurrencyTest extends TestCase
                 $business = App\Models\Business::findOrFail($argv[1]);
                 if ($argv[5] === 'create') {
                     $result = (new App\Application\Appointment\CreateAppointment($availability, $audit))->handle($business, (int) $argv[2], (int) $argv[3], (int) $argv[4], new DateTimeImmutable($argv[7]), 'system', 'race', 'test');
+                } elseif ($argv[5] === 'cancel') {
+                    $result = (new App\Application\Appointment\CancelAppointment($audit))->handle($business, (int) $argv[2], (int) $argv[6], 'system', 'race', 'test');
                 } else {
                     $result = (new App\Application\Appointment\RescheduleAppointment($availability, $audit))->handle($business, (int) $argv[2], (int) $argv[6], new DateTimeImmutable($argv[7]), null, 'system', 'race', 'test');
                 }
