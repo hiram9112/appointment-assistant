@@ -1,6 +1,6 @@
 # S09 — Complete Appointment lifecycle
 
-**Status:** Active  
+**Status:** Done  
 **Depends on:** S05  
 **Covers:** BR-06; BR-14
 

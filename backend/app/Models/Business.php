@@ -59,4 +59,9 @@ class Business extends Model
     {
         return $this->hasMany(ScheduleException::class);
     }
+
+    public function conversations(): HasMany
+    {
+        return $this->hasMany(Conversation::class);
+    }
 }

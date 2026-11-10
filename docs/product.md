@@ -560,8 +560,12 @@ active interaction.
 Information explicitly changed by the Customer must replace the previous value
 for the affected interaction.
 
-Conversation history must be stored independently from the active conversational
-state.
+Conversation history must be persisted as individual message records. The
+current context is reconstructed from the active Conversation's history; no
+separately persisted structured semantic state is required.
+
+AI capabilities must interpret relevant context, recognize changed preferences
+and request clarification when information is ambiguous.
 
 After a configurable period of inactivity, a new interaction may be treated as a
 new Conversation without losing persisted Customer or Appointment data.
