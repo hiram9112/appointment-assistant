@@ -1,6 +1,6 @@
 # S10 — Conversation foundation
 
-**Status:** Active  
+**Status:** Done  
 **Depends on:** Milestone 2  
 **Covers:** FR-08; BR-07
 
