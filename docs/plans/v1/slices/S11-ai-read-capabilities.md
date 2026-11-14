@@ -6,9 +6,11 @@
 
 ## Goal
 
-Enable natural-language Business, Service, Professional, and Appointment availability enquiries through Laravel AI SDK and the existing authoritative Laravel capabilities.
+Enable natural-language Business, Service, Professional, and Appointment availability enquiries through Laravel AI SDK and existing authoritative Laravel capabilities.
 
-Support coherent multi-turn interactions using S10 Conversation history without duplicating persistent conversation storage or moving Business rules into the AI layer.
+Provide the agent with current, customer-facing Business information as runtime context. Keep actual Appointment availability behind a validated read-only tool.
+
+Support multi-turn interaction through S10 Conversation history without introducing another persistent conversation store.
 
 ---
 
@@ -18,117 +20,146 @@ Support coherent multi-turn interactions using S10 Conversation history without 
 
 Use Laravel AI SDK with OpenAI as the V1 provider, following ADR-0004.
 
-Implement one conversational agent with four read-only tools:
+Implement one conversational agent using:
 
-| Tool                         | Existing capability                  |
-| ---------------------------- | ------------------------------------ |
-| `GetBusinessInformationTool` | `GetBusinessInformation`             |
-| `ListServicesTool`           | `ListServices`                       |
-| `GetServiceInformationTool`  | `GetServiceInformation`              |
-| `CheckAvailabilityTool`      | Existing S03 availability capability |
+- Stable instructions defining assistant behavior.
+- Fresh runtime Business context from Laravel application capabilities.
+- Active Conversation history from S10.
+- One read-only `CheckAvailabilityTool`.
 
-Tool names may follow equivalent existing repository conventions.
+The agent interprets Customer requests and may answer descriptive questions directly from runtime context.
 
-The agent interprets natural language and selects tools. Tools validate arguments and delegate to existing capabilities.
+Laravel remains authoritative for Business configuration, Professional-Service eligibility, availability, validation, and persistence.
 
-Business identity comes from trusted application context, never from model-selected identifiers.
+Business identity is supplied by trusted application code, never selected by the model.
 
-The AI layer must not independently calculate availability, infer Professional eligibility, invent unavailable information, or modify authoritative application state.
+### Runtime Business context
 
-### Conversation history
+Build compact, structured context using:
 
-Keep S10 as the authoritative Conversation and message store.
+- `GetBusinessInformation`;
+- `ListServices`.
 
-Use the SDK's supported external-history mechanism, preferably `withMessages()`, after verifying the installed version.
+Include the customer-facing information needed for FR-01 and FR-02:
 
-Do not use `RemembersConversations` or create SDK-managed Conversation persistence.
+- Business profile, contact information, timezone, operating hours, payment methods, and configured customer-facing policies.
+- Active Services with canonical IDs, names, descriptions, durations, prices, and currencies.
+- Eligible Professionals with canonical IDs and customer-facing display names, preserving Service eligibility relationships.
 
-For each AI turn:
+Use existing application DTOs rather than introducing a separate data-access layer.
 
-1. Retrieve the relevant completed earlier turns from the active S10 Conversation.
-2. Convert their persisted messages into SDK-compatible history.
-3. Preserve logical turn ordering.
-4. Exclude the current inbound message from supplied history.
-5. Pass the current inbound content to `prompt()`.
-6. Persist the accepted assistant response through S10.
+Preserve null, zero, false, and missing values correctly. Do not invent defaults.
 
-Messages belonging to later turns must not enter the current turn's context.
+Avoid unnecessary data duplication, especially repeated Professional records.
+
+Do not include Appointment occupancy, scheduling buffers, internal Professional schedules, Customer information, or unrelated persistence fields.
+
+The context is generated for each agent execution from current application data. It is not persisted as Conversation state, cached across turns, or hardcoded in static prompts.
+
+Separate stable instructions from runtime data. Treat Business-provided names and descriptions as untrusted content, not executable instructions.
+
+General operating hours may be explained to Customers, but must never be presented as confirmed Appointment availability.
+
+### Availability tool
+
+Expose one read-only AI tool:
+
+`CheckAvailabilityTool`
+
+The tool receives:
+
+- Canonical Service ID.
+- Optional canonical Professional ID.
+- Structured, bounded date/time arguments.
+
+The agent identifies the intended Service and Professional using runtime Business context.
+
+The tool validates generated IDs against current authoritative Business data before delegating to the existing S03 availability capability.
+
+Use straightforward SDK argument schemas. Do not duplicate the catalogue inside dynamic tool enums or introduce text-substring matching.
+
+Unknown, inactive, or cross-Business references must fail safely.
+
+The tool must preserve S03 behavior, including:
+
+- Professional-Service eligibility;
+- explicit Professional preferences;
+- available alternatives;
+- scheduling occupancy and buffers;
+- valid Appointment start ranges;
+- Business timezone and DST handling;
+- `from == to` as a valid exact-start enquiry.
+
+Do not independently calculate availability or generate artificial fixed slots.
+
+Return structured results distinguishing:
+
+- `ok`;
+- `unavailable`;
+- `requested_professional_unavailable`;
+- `requested_professional_ineligible`;
+- invalid or unknown references;
+- invalid temporal arguments.
+
+An explicitly requested Professional's ineligibility or unavailability takes precedence over the presence of alternatives.
+
+For a known, Business-owned but ineligible Professional, preserve S03's requested-Professional result and available alternatives rather than rejecting the request prematurely.
+
+Ambiguous natural-language references are handled by the agent through clarification, not by guessing an ID inside the tool.
+
+Professional names and display names are not unique identifiers.
+
+### Conversation context
+
+S10 remains the authoritative Conversation and message store.
+
+Use the external-history integration established in Task 1, without SDK-native Conversation persistence.
+
+The agent receives:
+
+1. Stable instructions.
+2. Current runtime Business context.
+3. Completed earlier turns from the active S10 Conversation.
+4. The current inbound message exactly once.
+5. The available tool definitions.
+
+Task 3 establishes completed-turn ordering. Task 4 integrates that ordering with the SDK.
 
 Previous Conversations are not automatically included after inactivity expiration.
 
-S10 stores user and assistant text rather than structured tool-execution history. This remains the default for S11.
+Store accepted assistant responses through S10. Do not persist runtime Business context, SDK tool traces, or separate semantic state.
 
-If a later request requires facts absent from persisted text, the agent must retrieve authoritative information again or request clarification.
-
-Do not introduce structured transcript persistence or semantic summaries without a demonstrated need.
-
-If the model context budget is exceeded, handle the limitation explicitly rather than silently discarding information required for conversational continuity.
-
-### Natural-language interpretation
-
-The agent must support the FR-08 behavior defined in `product.md`, including:
-
-- colloquial and incomplete requests;
-- alternative Service names;
-- context-dependent references;
-- relative dates and times;
-- changed preferences;
-- topic changes;
-- clarification when necessary.
-
-Interpret relative dates using the Business timezone and a testable operation time.
-
-The agent interprets expressions such as "tomorrow afternoon"; the availability tool validates the resulting structured date/time range and delegates scheduling to S03.
-
-Do not introduce a separate natural-language date parser in the tools.
-
-Service and Professional references must resolve against authoritative Business configuration.
-
-Preserve explicitly requested Professionals and the existing S03 rules for alternatives and non-prioritized Professional choices.
+When earlier conversation text cannot reliably establish a reference, the agent must clarify rather than invent missing information.
 
 ### AI-turn coordination
 
-S10 provides durable inbound-message persistence, idempotency, and participant-scoped synchronization. It does not coordinate complete AI generations.
+S10 handles inbound persistence and message idempotency. S11 adds coordination of complete AI executions.
 
-S11 must additionally guarantee:
+Required guarantees:
 
-- one logical AI turn per persisted inbound message;
-- at most one accepted assistant response per completed turn;
-- ordered processing of distinct turns for the same participant;
-- independent processing across unrelated participants;
-- recoverable provider failures and interrupted processing;
-- rejection of stale processing attempts;
-- no reactivation of superseded Conversations by delayed responses.
+- One logical AI turn per inbound message.
+- At most one accepted assistant response per completed turn.
+- Ordered processing for the same participant.
+- Independent processing across participants.
+- Recovery of failed or interrupted processing.
+- Rejection of stale processing attempts.
+- No late-response reactivation of superseded Conversations.
 
-Use the smallest durable turn representation and coordination mechanism compatible with the existing Laravel/PostgreSQL implementation.
+Use the smallest durable coordination mechanism supported by the existing Laravel/PostgreSQL architecture.
 
-Do not hold database transactions or locks open during external provider calls.
+Do not keep database transactions or locks open during provider calls.
 
-A timeout or expired processing claim does not guarantee that a previous OpenAI request has stopped. Only the currently authorized attempt may commit a result.
+Only the currently authorized attempt may commit a response.
 
-Provide an explicit internal mechanism to resume eligible pending or failed turns. Do not assume autonomous processing without a configured execution trigger.
-
-Preserve S10's inactivity semantics: elapsed time alone does not expire a Conversation. Expiration is evaluated when a new inbound message arrives.
-
-### Tool execution context
-
-The SDK may execute multiple read-only tools during one generation.
-
-S11 persists the accepted final assistant response, not every internal tool step.
-
-This decision must be validated against representative multi-turn scenarios.
-
-If text-only history proves insufficient, report the failing scenario and propose the smallest persistence extension for Developer approval.
-
-S12 write-operation recovery and idempotency remain outside this slice.
+Preserve S10's inactivity semantics and provide an explicit internal recovery/re-entry mechanism without introducing speculative background infrastructure.
 
 ### Verification
 
-Use SDK fakes for normal automated tests and real PostgreSQL for concurrency tests.
+Use Laravel AI SDK fakes for ordinary automated tests and real PostgreSQL for relevant concurrency tests.
 
-Fake provider responses verify integration contracts, not actual model comprehension.
+Fakes verify integration contracts, not actual natural-language interpretation.
 
-Natural-language behavior requires a bounded manual OpenAI smoke test marked `[Developer]`.
+Validate real conversational behavior separately through a bounded OpenAI smoke test marked `[Developer]`.
 
 ---
 
@@ -136,151 +167,189 @@ Natural-language behavior requires a bounded manual OpenAI smoke test marked `[D
 
 S11 excludes:
 
-- Customer registration and Appointment retrieval or modification through AI;
-- write tools, write confirmations, and Appointment mutation recovery;
-- WhatsApp/n8n transport and HTTP chat endpoints;
-- public demo and Business Admin interfaces;
-- SDK-native Conversation storage;
-- semantic memory, RAG, speculative tool transcripts or summaries;
+- Customer registration and AI Appointment management operations;
+- write tools and write-operation recovery;
+- WhatsApp/n8n transport and public HTTP chat endpoints;
+- Business Admin interfaces;
+- SDK-managed Conversation storage;
+- persistent semantic memory, RAG, embeddings, or alias infrastructure;
 - new scheduling algorithms or fixed booking grids;
-- notifications, reminders, and Calendar synchronization;
-- generalized queues, workflow engines, or locking frameworks.
+- notifications, reminders, and external calendar synchronization;
+- generalized workflow or queue infrastructure.
+
+Existing S01–S03 and S10 application contracts remain authoritative.
 
 ---
 
 # Task 1 — SDK foundation and external-history proof
 
+**Status:** Accepted — implemented.
+
 ## Goal
 
-Install Laravel AI SDK and prove compatibility with S10's existing persistent history without enabling SDK-native Conversation storage.
+Integrate Laravel AI SDK and verify that it can consume S10 history without enabling SDK-native Conversation persistence.
 
 ## Implementation
 
-1. Verify actual PHP, Laravel, and dependency versions.
-2. Install and lock a compatible Laravel AI SDK version.
-3. Configure the OpenAI provider and model using environment-backed Laravel configuration.
-4. Inspect the installed SDK's Agent, message, history, and fake APIs.
-5. Create a minimal agent skeleton.
-6. Implement the smallest adapter that maps S10 user/assistant messages into SDK-compatible history.
-7. Verify that the current inbound message is supplied exactly once.
-8. Confirm that SDK-native Conversation persistence remains disabled.
+1. Install and lock a compatible Laravel AI SDK release.
+2. Configure OpenAI through environment-backed Laravel configuration.
+3. Create the minimal `ConversationAgent`.
+4. Implement the S10-to-SDK message-history adapter.
+5. Preserve historical message roles and ordering.
+6. Supply the current inbound message exactly once.
+7. Verify integration with SDK fakes.
 
-Use either `withMessages()` or `Conversational`, not both.
+Use the supported external-history mechanism established during implementation.
 
-Do not implement AI tools, full agent behavior, or turn coordination.
+Do not enable `RemembersConversations`.
 
 ## Acceptance criteria
 
 - SDK installation and dependency resolution succeed.
-- An agent can consume S10 history through a supported API.
-- Message roles and ordering are preserved.
-- The current inbound message is not duplicated.
-- No additional Conversation persistence is introduced.
-- No live OpenAI request is required for automated validation.
+- The agent consumes S10 history.
+- The current message is not duplicated.
+- Business-scoped history remains isolated.
+- SDK-native Conversation persistence is not used.
+- Automated validation passes without live OpenAI requests.
 
 ## Tests
 
-Cover:
+Cover fake-agent execution, external-history mapping, current-message exclusion, Business isolation, and S10 regressions.
 
-1. Agent execution with a fake provider.
-2. External-history mapping and ordering.
-3. Current-message exclusion.
-4. Business-scoped history isolation.
-5. No SDK-native Conversation persistence.
-6. S10 regression compatibility.
-
-Run the applicable backend checks.
-
-**Do not implement Task 2.**
+**No changes are required to Task 1 for the revised architecture.**
 
 ---
 
-# Task 2 — Read-only AI tools
+# Task 2 — Runtime Business context and availability tool
 
 ## Goal
 
-Expose the existing S01–S03 read capabilities through validated Laravel AI SDK tools.
+Prepare authoritative runtime Business context and implement the single read-only tool required to calculate Appointment availability.
+
+This task prepares both components independently. Connecting them to the conversational agent belongs to Task 4.
 
 ## Implementation
 
-Implement:
+### Business context builder
 
-- `GetBusinessInformationTool`
-- `ListServicesTool`
-- `GetServiceInformationTool`
-- `CheckAvailabilityTool`
+Implement a small component, conceptually `BusinessContextBuilder`, using:
 
-Follow installed SDK tool contracts and existing Laravel dependency-injection conventions.
+- `GetBusinessInformation`;
+- `ListServices`.
 
-### Shared tool requirements
+Its input is a trusted Business.
 
-- Receive Business identity from trusted application context.
-- Define and validate model-supplied argument schemas.
-- Delegate to existing application capabilities.
-- Return structured authoritative results or explicit invalid/ambiguous/unavailable outcomes.
-- Never infer missing Business data.
-- Never perform authoritative writes.
+Its output is a compact, deterministic, structured representation of the customer-facing facts defined in the Runtime Business context section.
 
-### Business information
+Requirements:
 
-Reuse `GetBusinessInformation` without duplicating Business configuration logic.
+- Use existing application DTOs and capability contracts.
+- Include only active Services.
+- Preserve canonical Service and Professional IDs.
+- Represent Professional-Service eligibility explicitly.
+- Use existing Professional display-name fallback behavior.
+- Preserve exact decimal prices and distinguish zero from null.
+- Avoid unnecessary duplication of Professionals.
+- Handle empty catalogues and missing optional configuration.
+- Avoid exposing unrelated or non-customer-facing data.
+- Do not perform language interpretation, prompt construction, or Conversation persistence.
 
-### Services and Professionals
+Do not modify the underlying S01/S02 capabilities.
 
-Reuse `ListServices` and `GetServiceInformation`.
+### CheckAvailabilityTool
 
-Resolve requested references using the applicable Business catalogue and configured Professional eligibility.
+Implement the tool using the installed Laravel AI SDK Tool contract.
 
-Support ambiguous references by returning suitable candidates for conversational clarification.
+Define clear descriptions and schemas for canonical IDs and temporal inputs.
 
-Do not build a separate catalogue, matching framework, or Professional prioritization mechanism.
+The Business must be injected from trusted application context.
 
-### Availability
+Validate Service and Professional identity, ownership, and activity before invoking S03.
 
-Reuse the established S03 capability and its current PostgreSQL occupancy integration.
+Allow S03 to determine eligibility and available alternatives for a known requested Professional.
 
-The tool receives structured Service, Professional, and bounded temporal arguments.
+Validate time arguments using the applicable Business timezone and the established operation-time rules.
 
-Validate:
+Preserve exact-start queries and DST behavior.
 
-- Service and Professional references;
-- eligible Professional selection;
-- date/time validity;
-- Business-local timezone interpretation;
-- scheduling request boundaries.
+Delegate scheduling entirely to S03 and return structured results with the agreed status precedence.
 
-Pass validated inputs to S03.
+Do not add:
 
-Return the existing valid Appointment start ranges associated with their Professionals.
+- `GetBusinessInformationTool`;
+- `ListServicesTool`;
+- `GetServiceInformationTool`;
+- a textual `CatalogueReferences` matcher;
+- dynamic catalogue enums.
 
-Do not invent fixed slots, calculate scheduling rules, or silently replace a requested Professional.
+If the installed SDK requires a different schema representation, follow its actual API without changing the tool's approved semantics.
+
+### Documentation alignment
+
+Update the following documentation as part of Task 2:
+
+**`docs/product.md` — Section 6**
+
+Verify the current repository version of the Business configuration principle.
+
+Preserve the accepted distinction:
+
+- Business-specific values must not be hardcoded in static prompts or application source code.
+- Authoritative, Business-scoped data retrieved at runtime may be supplied as temporary, relevant AI context.
+- Laravel remains responsible for validating model-generated references.
+
+If this clarification already exists, do not duplicate it. Remove or generalize wording that unnecessarily restricts runtime grounding to dynamic tool schemas.
+
+Do not change FR-01, FR-02, FR-03, or FR-08 unless a concrete contradiction remains.
+
+**`docs/architecture.md` — AI boundary**
+
+Update the applicable AI integration explanation to represent both supported paths:
+
+- Laravel capabilities supply runtime descriptive Business context to the agent.
+- AI tools invoke Laravel capabilities when authoritative operations are required.
+
+Keep the existing separation between AI interpretation and Laravel Business rules.
+
+Make a targeted change; do not rewrite the architecture document.
+
+The current S11 plan already documents the revised design. Do not rewrite it again during implementation unless a verified implementation constraint requires correction.
+
+Do not change ADR-0004, `v1.md`, or completed S01–S03 slice plans.
 
 ## Acceptance criteria
 
-- All four tools invoke the intended capabilities.
-- Missing, inactive, invalid, ambiguous, and cross-Business references are handled safely.
-- Service prices, durations, and eligible Professionals reflect authoritative configuration.
-- Availability results preserve S03 scheduling behavior and Professional choices.
-- All tools are read-only.
+- Runtime context contains current authoritative Business, Service, and Professional information.
+- IDs and eligibility relationships are preserved.
+- Missing or unconfigured values are represented accurately.
+- Different Businesses produce isolated context.
+- Configuration changes are reflected when the context is rebuilt.
+- The context builder does not implement or persist conversational behavior.
+- `CheckAvailabilityTool` accepts canonical IDs and delegates to S03.
+- Requested Professionals remain distinguishable from alternatives.
+- Invalid references and temporal arguments fail safely.
+- The tool performs no authoritative writes.
+- Documentation reflects the accepted runtime-context design.
 
 ## Tests
 
 Cover:
 
-1. Configured and missing Business information.
-2. Active/inactive Services and nullable/free prices.
-3. Service details and eligible Professionals.
-4. Unknown, ambiguous, and cross-Business references.
-5. Professional display names and eligibility.
-6. Valid/invalid date ranges and timezone boundaries, including DST.
-7. Explicit Professional unavailable and valid alternatives.
-8. Availability with existing occupancy and buffers.
-9. Preservation of S03 start ranges without artificial grids.
-10. No writes or duplicated scheduling calculations.
+1. Business information, operating hours, payment methods, and nullable policies.
+2. Active/inactive Services, descriptions, durations, and exact prices.
+3. Professional IDs, display names, duplicate names, and eligibility relationships.
+4. Empty catalogues and missing optional configuration.
+5. Business isolation and refreshed context after configuration changes.
+6. Unknown, inactive, and cross-Business Service IDs.
+7. Unknown, cross-Business, available, unavailable, and ineligible Professionals.
+8. Requested-Professional status precedence with and without alternatives.
+9. Valid/invalid temporal arguments, including exact-start and DST cases.
+10. S03 availability results, occupancy, buffers, and start ranges.
+11. Absence of writes and duplicated scheduling logic.
 
-Run relevant S01–S03 regression tests.
+Run focused tests, applicable S01–S03 regressions, the complete backend suite, and lint.
 
-**Do not implement Task 3.**
+**Do not implement Task 3 or connect the completed agent.**
 
 ---
 
@@ -288,134 +357,90 @@ Run relevant S01–S03 regression tests.
 
 ## Goal
 
-Implement reliable AI-turn processing on top of S10, without coupling database transactions to OpenAI latency.
+Coordinate AI processing reliably on top of S10 without keeping database transactions open during OpenAI calls.
 
-This task establishes processing guarantees independently from the final conversational agent.
+Test coordination independently of the real conversational agent.
 
 ## Implementation
 
-### Turn persistence
+### Durable turns
 
-Introduce the smallest durable representation linking an inbound `ConversationMessage` to its processing outcome.
+Introduce the smallest persistent representation associating an inbound user message with its processing outcome.
 
-It must support:
+Support:
 
 - unique inbound-turn association;
-- pending, processing, completed, and recoverable failure states or equivalents;
+- pending, processing, completed, and recoverable-failure states or equivalent outcomes;
 - current processing ownership;
 - accepted assistant-message association;
-- required timestamps.
-
-A superseded or otherwise non-completable outcome may be represented where necessary.
-
-Choose the minimal schema and application contracts based on existing conventions.
+- necessary timestamps.
 
 Do not modify committed S10 migrations.
 
-### Registration and idempotency
+### Ordering and claims
 
-Repeated inbound deliveries must resolve to the same logical turn.
+Repeated inbound deliveries must resolve to one logical turn.
 
-Turn registration and inbound persistence must be atomic or have a reliable reconciliation path if interrupted between those operations.
+Ensure atomic registration or an explicit recovery path when inbound persistence and turn registration cannot occur in one atomic operation.
 
-A completed turn must not generate a second accepted response.
+Process distinct turns in participant order.
 
-### Processing order
-
-Coordinate processing by Business, channel, and participant identity.
-
-Distinct turns for one participant must be processed in logical inbound order.
-
-A later turn cannot bypass an unresolved earlier turn and generate using incomplete context.
+A later turn must not bypass an unresolved earlier turn.
 
 Independent participants must not be unnecessarily serialized.
 
-Provide explicit outcomes when processing is pending, already running, completed, or temporarily unable to proceed.
+Use short transactions for claiming, state transitions, and completion.
 
-### Claiming and recovery
+Do not hold locks across provider calls.
 
-Use short PostgreSQL transactions and existing Laravel conventions.
+Support controlled retries and reject stale completion attempts. An expired claim does not prove that an earlier provider request has stopped.
 
-Claim eligible work before invoking the generation operation.
-
-Do not hold locks across external execution.
-
-Support controlled retry of failed or interrupted work.
-
-The processing claim must prevent an older attempt from committing after another attempt becomes authoritative.
-
-If leases are used, expiration alone must not be treated as proof that the old execution stopped.
-
-Provide an explicit internal retry/re-entry path. No queue worker or scheduler is required in this slice.
+Provide an explicit internal mechanism to resume pending or failed work without requiring a new queue or scheduler.
 
 ### Completion
 
 On successful generation:
 
-1. Validate current processing ownership.
-2. Validate the Conversation's current lifecycle relationship to its participant.
-3. Reject a stale completion that would revive an already superseded Conversation.
+1. Verify processing ownership.
+2. Check that the Conversation has not been superseded.
+3. Coordinate that check with S10's participant-scoped lifecycle synchronization.
 4. Persist the assistant message through S10.
-5. Atomically mark the turn completed and associate the assistant message.
+5. Atomically associate the message with the completed turn.
 
-Coordinate the completion check with inbound Conversation lifecycle changes so a concurrent new Conversation cannot invalidate the result between validation and persistence.
+A delayed result must not reactivate a Conversation that has already been replaced.
 
-Do not reject an otherwise valid response solely because 12 hours elapsed during generation.
+Elapsed inactivity alone does not invalidate an otherwise current Conversation response.
 
-### Failures
+### Failures and history
 
-A provider failure must:
+Preserve inbound messages after provider failure.
 
-- preserve the inbound message;
-- avoid fabricated assistant success;
-- leave the turn recoverable where applicable.
+Do not fabricate successful assistant responses.
 
 A failed assistant insertion must roll back turn completion.
 
-S11 guarantees one accepted persistent assistant result, not exactly-once external provider execution.
+Expose completed-turn associations for Task 4's logical history reconstruction.
 
-### History ordering
-
-Expose the turn associations needed to build later AI context from completed earlier turns.
-
-Preserve each user message and its accepted assistant response in logical turn order, excluding later or unresolved turns.
-
-Use an injectable fake generation operation to test the coordinator without integrating the complete agent yet.
+S11 guarantees one accepted persisted result, not exactly-once provider execution.
 
 ## Acceptance criteria
 
-- Inbound messages have unique logical turns.
-- Duplicate deliveries do not produce duplicate completed responses.
-- Distinct turns preserve ordering.
+- Duplicate inbound messages do not produce duplicate completed responses.
+- Distinct turns preserve processing order.
 - Independent participants can progress concurrently.
-- Provider execution happens outside database transactions.
+- Provider execution occurs outside database transactions.
 - Failed/interrupted processing is recoverable.
-- Stale attempts cannot commit accepted results.
-- Assistant persistence and turn completion are atomic.
-- Superseded Conversations cannot be revived by late replies.
-- Existing S10 inactivity behavior remains unchanged.
-- Pending work has an explicit progress/retry path.
+- Stale attempts cannot commit accepted responses.
+- Assistant persistence and completion are atomic.
+- Superseded Conversations cannot be reactivated.
+- S10 inactivity behavior remains unchanged.
+- Pending work has an explicit re-entry path.
 
 ## Tests
 
-Cover:
+Cover duplicate deliveries, concurrent messages, FIFO ordering, participant isolation, interrupted execution, retries, stale claims, Conversation replacement, long-running responses, atomic rollback, completed-turn associations, and relevant multi-process PostgreSQL races.
 
-1. First-turn registration and repeated delivery.
-2. Duplicate delivery before, during, and after processing.
-3. Concurrent distinct messages and FIFO ordering.
-4. Independent-participant concurrency.
-5. Failure and controlled retry.
-6. Interrupted registration or claim recovery.
-7. Stale completion after claim replacement.
-8. Late response after a new Conversation is created.
-9. Long-running response without Conversation replacement.
-10. Atomic assistant persistence and rollback.
-11. Correct history associations.
-12. Business/participant isolation.
-13. Relevant multi-process PostgreSQL races.
-14. S10 lifecycle and concurrency regressions.
-
-Run the complete backend suite and mandatory lint checks.
+Run the complete backend suite, S10 regressions, and mandatory checks.
 
 **Do not implement Task 4.**
 
@@ -425,90 +450,94 @@ Run the complete backend suite and mandatory lint checks.
 
 ## Goal
 
-Connect the read-only AI agent to the four tools, S10 history, and Task 3 turn processing.
+Connect the Task 1 agent foundation, Task 2 runtime context and availability tool, and Task 3 coordinator into a coherent conversational read path.
 
 ## Implementation
+
+### Agent execution
+
+For each authorized AI turn:
+
+1. Resolve the trusted Business and capture a consistent operation time.
+2. Build fresh descriptive Business context from Task 2.
+3. Construct the agent's instructions from stable behavioral rules and clearly delimited runtime data.
+4. Load completed earlier turns from S10 through Task 3's turn associations.
+5. Supply historical messages using the SDK mechanism verified in Task 1.
+6. Exclude the current inbound message and all later turns from that history.
+7. Register only `CheckAvailabilityTool`.
+8. Execute the agent with the current inbound text.
+9. Submit the result through Task 3's authorized completion path.
+
+The operation time must be available to the agent in the Business timezone so relative dates can be interpreted consistently.
+
+Runtime Business context is regenerated for each execution and is not persisted as semantic Conversation state.
+
+Use the installed SDK's supported agent configuration and dependency-injection APIs.
 
 ### Agent behavior
 
 Configure the agent to:
 
-- interpret natural-language Business and scheduling requests;
-- invoke authoritative tools for factual information;
-- reuse relevant active Conversation context;
-- recognize changed preferences and topic changes;
-- clarify incomplete or ambiguous requests;
-- preserve explicitly selected Professionals;
-- avoid fabricated Business facts or available times.
+- Answer descriptive enquiries from runtime Business context.
+- Interpret colloquial Service and Professional references.
+- Select canonical IDs when invoking availability.
+- Ask for clarification when several Services or Professionals are plausible.
+- Preserve explicit Professional preferences.
+- Interpret relative dates using the Business timezone and operation time.
+- Recognize changed preferences and topic changes.
+- Avoid asking again for sufficiently established information.
+- Use `CheckAvailabilityTool` whenever actual availability must be determined.
+- Never infer valid Appointment starts from opening hours alone.
+- Avoid inventing unavailable or unconfigured facts.
 
-Prompts must describe general behavior, not hardcode Lúmina-specific configuration.
+Do not hardcode reference-Business values in stable instructions.
 
-The agent interprets natural-language expressions. Tools validate structured arguments and delegate authoritative operations.
+### Context continuity
 
-### Context integration
+Use completed-turn history rather than raw insertion order when requests overlap.
 
-Use Task 1's external-history adapter and Task 3's turn associations.
+Do not assume transient SDK tool results persist between turns.
 
-For each turn:
+When previously discussed configuration changes, use current authoritative values. Clarify stale or ambiguous references when necessary.
 
-1. Load the current S10 Conversation.
-2. Retrieve completed earlier turns in logical order.
-3. Map their persisted user/assistant messages into SDK history.
-4. Exclude current and later inbound messages.
-5. Invoke the agent with the current inbound content.
-6. Submit the final response to the coordinator's authorized completion path.
+Do not expose canonical IDs as customer-facing labels unless they are needed to resolve an ambiguity appropriately.
 
-Do not assume raw message insertion order always represents complete conversational turn order.
+### Errors
 
-### Multi-turn behavior
+Reuse Task 3's failure/recovery behavior.
 
-Support contextual follow-ups about previously discussed:
+Distinguish ordinary clarification and unavailable information from technical failures.
 
-- Services, prices, and durations;
-- eligible Professionals;
-- dates and availability;
-- alternative choices;
-- changed requests.
-
-When text history does not reliably identify a reference, retrieve authoritative information again or ask for clarification.
-
-Do not fabricate remembered tool results.
-
-### Failure handling
-
-Use Task 3's recovery behavior.
-
-Provider failures must not produce a successful assistant response.
-
-Expected clarification, invalid references, and unavailable scheduling information remain distinct from technical failures.
+Do not persist fabricated success after provider failure.
 
 ## Acceptance criteria
 
-- A single agent exposes the four read-only tools.
-- The agent consumes the correct active S10 context.
-- Current and later messages are not duplicated or leaked into prompts.
-- Responses use authoritative application results.
-- Follow-ups, changes, and clarifications are supported.
-- Agent execution uses the durable coordinator.
-- No Appointment-changing tools or duplicate Conversation store are introduced.
+- One agent receives fresh runtime Business context and the correct S10 history.
+- Descriptive data is available without descriptive lookup tools.
+- Only the availability read tool is registered.
+- Availability requests use S03.
+- Current/later messages do not leak into historical context.
+- Changed preferences and clarification are supported.
+- Business isolation is maintained.
+- Assistant persistence is controlled by the coordinator.
+- No SDK-native Conversation storage or write tools are introduced.
 
 ## Tests
 
-Use SDK fakes to verify:
+Use SDK fakes and application tests to verify:
 
-1. Agent and tool registration.
-2. Tool invocation wiring.
-3. External-history reconstruction.
-4. Current-message exclusion and logical ordering.
-5. Context isolation after Conversation expiration.
-6. Correct assistant persistence.
-7. Provider failure behavior.
-8. Business and participant isolation.
-9. Absence of write tools.
+1. The correct Business context reaches the agent.
+2. Context is rebuilt between executions.
+3. Business and Conversation isolation.
+4. Only the approved tool is registered.
+5. Availability tool wiring and structured results.
+6. Correct history reconstruction and current-message exclusion.
+7. Conversation expiration and replacement.
+8. Assistant persistence and provider failure handling.
 
-Do not treat fake responses as proof of linguistic interpretation.
+Test the context/tool integration deterministically. Actual model decisions about when to invoke a tool belong to Task 5's live evaluation.
 
-Run complete backend validation.
+Run the complete backend validation.
 
 **Do not implement Task 5.**
 
@@ -518,72 +547,77 @@ Run complete backend validation.
 
 ## Goal
 
-Validate S11 against FR-01, FR-02, FR-03, and FR-08 using realistic multi-turn scenarios and the reference Business.
+Validate S11 against FR-01, FR-02, FR-03, and FR-08 through realistic multi-turn scenarios.
 
 ## Implementation
 
-### Automated integration tests
+### Automated verification
 
-Verify the complete application path:
+Exercise the complete path:
 
-S10 inbound persistence → AI-turn coordination → SDK agent → read-only tools → authoritative capabilities → assistant persistence → subsequent context.
+S10 inbound persistence → AI-turn coordination → runtime Business context → SDK agent → optional availability tool → authoritative Laravel capabilities → assistant persistence.
 
-Cover at least:
+Cover:
 
-1. Business information, including missing configuration.
-2. Service catalogue, price, duration, and Professional follow-ups.
-3. Availability with explicit and unspecified Professional preferences.
-4. Clarification followed by continuation.
-5. Changes of Service, Professional, or date.
-6. Topic changes and context-dependent references.
-7. Inactivity expiration without previous-context inheritance.
-8. Duplicate and concurrent inbound messages.
-9. Provider failure and recovery.
-10. Correct Business isolation and read-only behavior.
-11. No SDK-native persistent memory.
-12. No regression of S01–S03 or S10.
+1. Business enquiries, including unavailable configuration.
+2. Services, prices, durations, and eligible Professionals.
+3. Canonical ID preservation and duplicate Professional names.
+4. Availability with explicit or unspecified Professional preferences.
+5. Unavailable/ineligible Professionals and alternatives.
+6. Context-dependent references and clarification.
+7. Changes of Service, Professional, date, or topic.
+8. Conversation inactivity and current-context separation.
+9. Duplicate/concurrent messages and recoverable failures.
+10. Business isolation and read-only behavior.
+11. No SDK-native Conversation persistence.
+12. S01–S03 and S10 regressions.
 
-Use SDK fakes for provider integration and exercise the actual tools and application capabilities directly.
+Use SDK fakes for provider integration tests.
+
+Do not treat fake responses as evidence that the model correctly interprets natural language.
 
 ### Manual OpenAI verification — [Developer]
 
-Using the selected model and Lúmina reference data, validate a bounded Spanish-language smoke matrix covering:
+Using the configured model and Lúmina reference data, verify:
 
-- colloquial Service requests and alternative names;
-- incomplete or ambiguous sentences;
-- relative dates and Business-local times;
-- references such as "the second Service";
-- explicit Professional preferences;
-- unavailable Professionals and alternatives;
-- changes of mind;
-- topic changes and continuity;
-- clarification without unnecessary repetition.
+- Colloquial and alternative Service names.
+- Ambiguous Services and duplicate Professional names.
+- Descriptive enquiries answered without lookup-tool calls.
+- Actual availability enquiries invoking S03.
+- Relative dates and Business-local time.
+- Exact-start requests.
+- References such as "the second Service".
+- Explicit Professional preferences and available alternatives.
+- Changed preferences and topic changes.
+- Multi-turn continuity without unnecessary repetition.
+- Business configuration changes reflected in later turns.
+- No fabricated availability based on descriptive context.
 
-Verify tool selection, argument interpretation, and factual responses.
+Record pass/fail results and concrete defects.
 
-Record the outcomes and any concrete failure.
+If a required scenario fails because text-only history loses essential tool context, document the failure and obtain Developer approval before adding persistent tool transcripts.
 
-Do not commit credentials or sensitive transcripts.
+Do not commit provider credentials or sensitive interaction transcripts.
 
-If a scenario fails specifically because text-only history loses essential tool context, document the evidence and request approval before introducing structured transcript persistence.
+### Regression and documentation
 
-### Regression validation
+Run the complete backend suite, required lint/static checks, relevant PostgreSQL concurrency tests, and existing S01–S03/S10 regressions.
 
-Run the complete backend suite, mandatory lint/static checks, and relevant concurrency tests.
+Verify that the implemented AI/context boundary matches `docs/product.md`, `docs/architecture.md`, and this S11 plan.
 
-Confirm that S11 has not modified Appointment rules, Customer identity semantics, or S10 lifecycle guarantees.
+Apply only evidence-backed documentation corrections if implementation reveals a mismatch.
 
 ## Acceptance criteria
 
-- FR-01, FR-02, and FR-03 requests use the established authoritative capabilities.
-- FR-08 conversational continuity and clarification work in the agreed scenarios.
+- FR-01 and FR-02 enquiries are answered from authoritative runtime context.
+- FR-03 availability is obtained through S03.
+- FR-08 continuity, contextual interpretation, and clarification meet the agreed scenarios.
 - Business timezone and Professional preferences are respected.
-- Missing or unavailable information is not fabricated.
-- Complete AI turns are ordered, idempotent, and recoverable.
-- Technical failures do not generate false success.
-- No S12 or unrelated functionality is introduced.
-- Automated checks pass.
-- Manual provider validation is completed or explicitly recorded as unverified.
+- Missing information and valid Appointment availability are not fabricated.
+- AI turns are ordered, idempotent, and recoverable.
+- No S12 operations or unrelated infrastructure are introduced.
+- Required automated checks pass.
+- Manual provider verification is completed or explicitly recorded as unverified.
 
 ---
 
@@ -591,31 +625,31 @@ Confirm that S11 has not modified Appointment rules, Customer identity semantics
 
 S11 is complete when:
 
-- Laravel AI SDK is integrated with OpenAI and S10 history;
-- the four read-only tools use existing application capabilities;
-- authoritative Business and scheduling rules remain in Laravel;
-- natural-language enquiries and multi-turn context satisfy the agreed acceptance scenarios;
-- AI-turn coordination prevents duplicate accepted responses and stale Conversation reactivation;
-- failure recovery and relevant concurrency guarantees are validated;
-- S10 remains the only persistent Conversation store;
-- all required tests, lint checks, and manual acceptance actions are completed or explicitly documented.
+- Laravel AI SDK consumes S10 history without a separate persistent Conversation store.
+- Runtime Business context provides authoritative customer-facing configuration.
+- The agent exposes only the necessary read-only availability tool.
+- Scheduling and Professional eligibility remain authoritative in Laravel.
+- Natural-language interpretation and multi-turn continuity satisfy the acceptance scenarios.
+- Turn coordination, idempotency, and recovery are verified.
+- Documentation accurately reflects the implemented architecture.
+- Required tests and Developer validation are completed or explicitly documented.
 
-The Developer reviews and accepts the implementation before marking S11 as `Done`.
+The Developer reviews and accepts S11 before marking it `Done` in `v1.md`.
 
-The Agent must not create a Git commit.
+The Agent must not stage or commit changes.
 
 ---
 
 ## References
 
-Consult only the applicable sections of:
+Consult only applicable sections of:
 
-- `docs/product.md` — FR-01, FR-02, FR-03, FR-08.
+- `docs/product.md` — FR-01, FR-02, FR-03, FR-08, and Section 6.
 - `docs/plans/v1/v1.md` — S11.
 - `docs/plans/v1/slices/S10-conversation-foundation.md`.
-- `docs/architecture.md` — AI and application boundaries.
+- `docs/architecture.md` — AI/application boundaries.
 - `docs/adr/0004-laravel-ai-sdk.md`.
-- Existing S01–S03 capability contracts.
+- Existing S01–S03 capabilities and DTO contracts.
 - Official Laravel AI SDK documentation and installed package source.
 
 Follow `AGENTS.md` and applicable backend rules. Do not redesign unrelated slices.

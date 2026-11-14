@@ -188,8 +188,11 @@ Business-level scheduling policies may include:
 - whether Customer reminders are enabled;
 - reminder timing when reminders are enabled.
 
-Business configuration values are application data and must not be embedded in
-conversational prompts or application source code.
+Business configuration values are application data and must not be hardcoded in
+static conversational prompts or application source code. Authoritative,
+Business-scoped data retrieved at runtime may be supplied as temporary, relevant
+AI context. Laravel remains responsible for validating model-generated references
+against current Business data.
 
 The `cancellation_notice_minutes` and `rescheduling_notice_minutes` values are
 advisory in V1, not minimum notice restrictions. The application enforces the
