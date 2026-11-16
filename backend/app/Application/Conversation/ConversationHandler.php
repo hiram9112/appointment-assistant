@@ -26,13 +26,13 @@ final class ConversationHandler
         $participant = json_encode([(string) $business->getKey(), $channel, $senderIdentity], JSON_THROW_ON_ERROR);
         $key = hash('sha256', json_encode([$participant, $messageId], JSON_THROW_ON_ERROR));
 
-        return DB::transaction(function () use ($business, $channel, $senderIdentity, $content, $participant, $key): ConversationMessage|ConversationOutcome {
+        return DB::transaction(function () use ($business, $channel, $senderIdentity, $content, $key): ConversationMessage|ConversationOutcome {
             $existing = ConversationMessage::query()->where('idempotency_key', $key)->first();
             if ($existing) {
                 return $existing->content === $content ? $existing : ConversationOutcome::ConflictingMessage;
             }
 
-            DB::select('select pg_advisory_xact_lock(?)', [unpack('J', substr(hash('sha256', $participant, true), 0, 8))[1]]);
+            (new ConversationParticipantLock)->acquire($business->id, $channel, $senderIdentity);
 
             $existing = ConversationMessage::query()->where('idempotency_key', $key)->first();
             if ($existing) {
