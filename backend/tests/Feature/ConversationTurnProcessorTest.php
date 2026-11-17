@@ -91,6 +91,28 @@ class ConversationTurnProcessorTest extends TestCase
         $this->assertDatabaseCount('appointments', 0);
     }
 
+    public function test_agent_receives_availability_preconditions_and_clarification_examples(): void
+    {
+        $this->inbound('1', 'Can I have a massage with Claudia?');
+        ConversationAgent::fake(['What date would you like?'])->preventStrayPrompts();
+
+        $this->process();
+
+        ConversationAgent::assertPrompted(function (AgentPrompt $prompt): bool {
+            $instructions = $prompt->agent->instructions();
+            $this->assertStringContainsString('identify the Service unambiguously', $instructions);
+            $this->assertStringContainsString('resolve any explicitly requested Professional to exactly one candidate', $instructions);
+            $this->assertStringContainsString('Customer-supplied date or date range from the current message or completed history', $instructions);
+            $this->assertStringContainsString('never assume today, tomorrow, or an arbitrary search window', $instructions);
+            $this->assertStringContainsString('No Professional preference is required when none was requested', $instructions);
+            $this->assertStringContainsString('two plausible Professionals are named Alex', $instructions);
+            $this->assertStringContainsString('"a massage with Claudia" without an established date', $instructions);
+            $this->assertStringContainsString('Interpret relative dates using operation_time and the Business timezone', $instructions);
+
+            return true;
+        });
+    }
+
     public function test_context_is_rebuilt_on_each_execution_even_with_a_stale_business_instance(): void
     {
         $service = Service::factory()->for($this->business)->create(['name' => 'Old service']);

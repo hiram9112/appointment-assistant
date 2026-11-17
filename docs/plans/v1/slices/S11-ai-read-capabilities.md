@@ -1,6 +1,6 @@
 # S11 — AI read capabilities
 
-**Status:** Active  
+**Status:** Done<br>
 **Depends on:** S01, S02, S03, S10  
 **Covers:** FR-01; FR-02; FR-03; FR-08
 
@@ -545,6 +545,8 @@ Run the complete backend validation.
 
 # Task 5 — Conversational acceptance and regression
 
+**Status:** Completed — automated verification passed and the Developer accepted the live behavioral results; final diff review and commit remain with the Developer.
+
 ## Goal
 
 Validate S11 against FR-01, FR-02, FR-03, and FR-08 through realistic multi-turn scenarios.
@@ -618,6 +620,42 @@ Apply only evidence-backed documentation corrections if implementation reveals a
 - No S12 operations or unrelated infrastructure are introduced.
 - Required automated checks pass.
 - Manual provider verification is completed or explicitly recorded as unverified.
+
+## Task 5 verification record — 2026-11-16
+
+### Automated
+
+- Added `backend/tests/Feature/ConversationReadAcceptanceTest.php` with scripted multi-turn SDK-fake scenarios covering descriptive enquiries, missing configuration, exact prices and durations, canonical IDs and duplicate Professional names, clarification history, preference and topic changes, exact-start availability, requested-Professional status precedence and alternatives, inactivity, refreshed context, and Business isolation.
+- Those scenarios exercise S10 inbound persistence through coordinated agent execution, the real availability tool and S03 capabilities when requested, and accepted assistant persistence. Read-only verification permits only Conversation/message/AI-turn writes and checks that existing Appointment data remains unchanged. SDK-native Conversation storage is forbidden in the tests.
+- Extended `backend/tests/Feature/AiTurnConcurrencyTest.php` to run duplicate/distinct delivery races and killed-worker recovery through the SDK-backed `ConversationTurnProcessor`, retaining the independent coordinator cases.
+- Existing context, tool, processor, and coordinator tests retain coverage for invalid references and dates, DST, overlapping-turn history, failed providers and assistant insertion, retries, stale attempts, and Conversation replacement.
+
+Validation from `backend/`:
+
+| Command                                                                                                                              | Result                                                                                                                        |
+| ------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| `php artisan test --compact tests/Feature/ConversationReadAcceptanceTest.php tests/Feature/AiTurnConcurrencyTest.php`                | Passed: 14 tests, 436 assertions, real PostgreSQL                                                                             |
+| `php artisan test --compact tests/Feature/ConversationAgentEvaluationRunnerTest.php tests/Feature/ConversationTurnProcessorTest.php` | Passed: 26 tests, 299 assertions; provider HTTP replaced by fakes                                                             |
+| `composer test`                                                                                                                      | Passed: 386 tests, 2,256 assertions, including S01–S03/S10 regressions, PostgreSQL concurrency tests and offline runner tests |
+| `composer test` (latest)                                                                                                             | Passed: 389 tests, 2,315 assertions                                                                                           |
+| `vendor/bin/pint --dirty --format agent`                                                                                             | Passed                                                                                                                        |
+| `composer lint`                                                                                                                      | Passed                                                                                                                        |
+| `git diff --check` (repository root)                                                                                                 | Passed                                                                                                                        |
+| `php tests/Evaluations/ConversationAgent/run-live.php --help` / `php -l tests/Evaluations/ConversationAgent/run-live.php`            | Offline CLI checks; no Laravel bootstrap or provider calls                                                                    |
+
+No separate backend static-analysis command is configured in Composer or backend CI. Review against Product Section 6, FR-01/02/03/08, the architecture AI boundary, and this plan found no documentation mismatch. The targeted instruction correction below did not change the application boundary.
+
+### Manual OpenAI verification — [Developer]
+
+**First execution — 2026-11-16, `gpt-4.1-mini`:** `contract_failures`; 22 turns completed, with scenarios 2 and 10 failing and the other ten contracts passing. Scenario 2 arbitrarily selected an ID when two Professionals named Alex remained plausible. Scenario 10 searched availability without a Customer-supplied date. These were conversational model-behavior issues, not incorrect acceptance expectations. The run used 38 HTTP requests, 64,819 input tokens and 2,123 output tokens (66,942 reported total).
+
+**Corrections:** `ConversationAgent::instructions()` now requires clarification for ambiguous Services or Professionals and missing dates, with concise examples. The Developer configured `gpt-6-luna` through `OPENAI_MODEL`; its evaluation output cap was raised to 2,048 tokens per request while retaining the other safeguards. No deterministic language interpretation or semantic argument validation was introduced.
+
+**Second execution — 2026-11-16, `gpt-6-luna`:** `completed_needs_review`; all **12 scenarios and 22 turns** passed automated contracts. Scenarios 2 and 10 asked for clarification as intended, and tool results matched authoritative S03. The Developer reviewed the responses, found no blocking response-quality issues, and accepted the live behavioral results. The run used **36 HTTP requests**, **63,943 input tokens**, **2,726 output tokens** (including **969 reasoning tokens**), **66,669 reported tokens total**, and **355,474 request bytes**.
+
+The second run's recorded limits were 48 total HTTP requests, three per turn, 2,048 output tokens per Luna request (512 for other models), 24,000 request bytes per request, 750,000 total request bytes, a 160,000 reported-token threshold, and a 60-second request timeout. These are safeguards, not a guaranteed monetary budget.
+
+The reusable, Developer-only evaluation tool now resides in `backend/tests/Evaluations/ConversationAgent/`; see its [README](../../../../backend/tests/Evaluations/ConversationAgent/README.md) for setup, safety, execution, evidence and future scenarios. Its JSON output remains private and ignored by Git. Contract success is distinct from the Developer's subsequent behavioral acceptance. No sensitive transcripts or provider credentials are recorded here.
 
 ---
 

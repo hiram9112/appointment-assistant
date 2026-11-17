@@ -48,7 +48,7 @@ class AiTurnConcurrencyTest extends TestCase
     }
 
     #[DataProvider('deliveries')]
-    public function test_concurrent_registration_and_processing_preserve_idempotency_and_fifo(bool $duplicate): void
+    public function test_concurrent_registration_and_processing_preserve_idempotency_and_fifo(bool $duplicate, string $processing): void
     {
         $first = $this->start('inbound', ['message' => '1'], 'insert');
         $this->assertSame("locked\n", $this->line($first));
@@ -60,14 +60,14 @@ class AiTurnConcurrencyTest extends TestCase
         $this->assertSame($duplicate, $firstResult['id'] === $secondResult['id']);
         $this->assertDatabaseCount('ai_turns', $duplicate ? 1 : 2);
 
-        $processing = $this->start('process', [], 'generate');
-        $this->assertSame("generating\n", $this->line($processing));
+        $worker = $this->start($processing, [], 'generate');
+        $this->assertSame("generating\n", $this->line($worker));
         $otherDelivery = $this->start('inbound', ['message' => '3']);
         $this->assertSame('turn', $this->finish($otherDelivery)['kind']);
-        $competing = $this->start('process');
+        $competing = $this->start($processing);
         $this->assertSame(['kind' => 'outcome', 'name' => 'Busy'], $this->finish($competing));
-        $this->release($processing);
-        $this->assertSame('message', $this->finish($processing)['kind']);
+        $this->release($worker);
+        $this->assertSame('message', $this->finish($worker)['kind']);
         $this->assertSame(AiTurnState::Completed, AiTurn::findOrFail($firstResult['id'])->state);
 
         $next = app(AiTurnCoordinator::class)->claimNext($this->business, 'web', 'sender');
@@ -78,7 +78,12 @@ class AiTurnConcurrencyTest extends TestCase
 
     public static function deliveries(): array
     {
-        return ['duplicate' => [true], 'distinct' => [false]];
+        return [
+            'duplicate through coordinator' => [true, 'process'],
+            'distinct through coordinator' => [false, 'process'],
+            'duplicate through SDK agent' => [true, 'sdk_process'],
+            'distinct through SDK agent' => [false, 'sdk_process'],
+        ];
     }
 
     public function test_independent_participants_can_claim_while_another_claim_transaction_is_open(): void
@@ -162,10 +167,11 @@ class AiTurnConcurrencyTest extends TestCase
         return ['replacement first' => [true], 'completion first' => [false]];
     }
 
-    public function test_killed_provider_execution_is_durably_recoverable(): void
+    #[DataProvider('processingPaths')]
+    public function test_killed_provider_execution_is_durably_recoverable(string $processing): void
     {
         $turn = app(AiTurnCoordinator::class)->inbound($this->business, 'web', 'sender', '1', 'hello');
-        $interrupted = $this->start('process', [], 'generate');
+        $interrupted = $this->start($processing, [], 'generate');
         $this->assertSame("generating\n", $this->line($interrupted));
         $this->assertSame(AiTurnState::Processing, $turn->fresh()->state);
         proc_terminate($this->workers[$interrupted]['process']);
@@ -174,10 +180,15 @@ class AiTurnConcurrencyTest extends TestCase
         }
         proc_close($this->workers[$interrupted]['process']);
         unset($this->workers[$interrupted]);
-        $recovery = $this->start('process', [], '', '2030-01-01 12:05:00 UTC');
+        $recovery = $this->start($processing, [], '', '2030-01-01 12:05:00 UTC');
         $this->assertSame('message', $this->finish($recovery)['kind']);
         $this->assertSame(AiTurnState::Completed, $turn->fresh()->state);
         $this->assertDatabaseCount('conversation_messages', 2);
+    }
+
+    public static function processingPaths(): array
+    {
+        return ['coordinator' => ['process'], 'SDK agent' => ['sdk_process']];
     }
 
     /** @return array{turn: int, token: string, inbound: int} */
@@ -211,6 +222,15 @@ class AiTurnConcurrencyTest extends TestCase
                 $data = json_decode($argv[3], true, flags: JSON_THROW_ON_ERROR);
                 $sender = $data['sender'] ?? 'sender';
                 $coordinator = app(App\Application\Conversation\AiTurnCoordinator::class);
+                if ($argv[2] === 'sdk_process') {
+                    config(['ai.default' => 'openai', 'ai.providers.openai.models.text.default' => 'test-model']);
+                    $app->bind(Laravel\Ai\Contracts\ConversationStore::class, fn () => throw new RuntimeException('Unexpected SDK storage'));
+                    App\Application\Conversation\ConversationAgent::fake(function () use ($barrier, $wait): string {
+                        if (Illuminate\Support\Facades\DB::transactionLevel() !== 0) { throw new RuntimeException('Open provider transaction'); }
+                        if ($barrier === 'generate') { $wait('generating'); }
+                        return 'answer';
+                    })->preventStrayPrompts();
+                }
                 $result = match ($argv[2]) {
                     'inbound' => $coordinator->inbound($business, 'web', $sender, $data['message'], 'hello'),
                     'claim' => $coordinator->claimNext($business, 'web', $sender),
@@ -222,7 +242,16 @@ class AiTurnConcurrencyTest extends TestCase
                         if ($barrier === 'generate') { $wait('generating'); }
                         return 'answer';
                     }),
+                    'sdk_process' => app(App\Application\Conversation\ConversationTurnProcessor::class)->processNext($business, 'web', $sender),
                 };
+                if ($argv[2] === 'sdk_process') {
+                    if ($result instanceof App\Models\ConversationMessage) {
+                        App\Application\Conversation\ConversationAgent::assertPromptedTimes(1);
+                        App\Application\Conversation\ConversationAgent::assertPrompted('hello');
+                    } else {
+                        App\Application\Conversation\ConversationAgent::assertNeverPrompted();
+                    }
+                }
                 $output = match (true) {
                     $result instanceof App\Application\Conversation\AiTurnOutcome => ['kind' => 'outcome', 'name' => $result->name],
                     $result instanceof App\Application\Conversation\AiTurnClaim => ['kind' => 'claim', 'id' => $result->turnId, 'token' => $result->token],
