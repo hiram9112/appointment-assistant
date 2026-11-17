@@ -7,6 +7,7 @@ use App\Application\Conversation\AiTurnCoordinator;
 use App\Application\Conversation\AiTurnState;
 use App\Models\AiTurn;
 use App\Models\Business;
+use App\Models\ChannelIdentity;
 use App\Models\Conversation;
 use App\Models\ConversationMessage;
 use Illuminate\Foundation\Testing\DatabaseMigrations;
@@ -98,6 +99,75 @@ class AiTurnConcurrencyTest extends TestCase
         $this->assertSame(AiTurnState::Completed, $other->fresh()->state);
         $this->release($first);
         $this->assertSame('claim', $this->finish($first)['kind']);
+    }
+
+    #[DataProvider('registrationScopes')]
+    public function test_concurrent_customer_registration_reuses_one_identity_and_associates_each_current_conversation(bool $differentBusiness): void
+    {
+        $coordinator = app(AiTurnCoordinator::class);
+        $coordinator->inbound($this->business, 'whatsapp', 'sender', '1', 'Register me');
+        $claim = $coordinator->claimNext($this->business, 'whatsapp', 'sender');
+        $otherBusiness = $differentBusiness ? Business::factory()->create() : $this->business;
+        $otherClaim = $claim;
+        if ($differentBusiness) {
+            $coordinator->inbound($otherBusiness, 'whatsapp', 'sender', '1', 'Register me too');
+            $otherClaim = $coordinator->claimNext($otherBusiness, 'whatsapp', 'sender');
+        }
+
+        $first = $this->start('register_customer', $this->claimData($claim), 'registration');
+        $this->assertSame("locked\n", $this->line($first));
+        $this->assertDatabaseCount('customers', 0);
+        $second = $this->start('register_customer', [...$this->claimData($otherClaim), 'business' => $otherBusiness->id]);
+        $this->assertBlocked($first, $second);
+        $this->release($first);
+        $firstResult = $this->finish($first);
+        $secondResult = $this->finish($second);
+
+        $this->assertSame('registered', $firstResult['status']);
+        $this->assertSame('already_registered', $secondResult['status']);
+        $this->assertSame($firstResult['customer'], $secondResult['customer']);
+        $customerId = $firstResult['customer']['id'];
+        $this->assertSame($customerId, ChannelIdentity::sole()->customer_id);
+        $this->assertSame($customerId, Conversation::findOrFail($claim->inboundMessage->conversation_id)->customer_id);
+        $this->assertSame($customerId, Conversation::findOrFail($otherClaim->inboundMessage->conversation_id)->customer_id);
+        $this->assertDatabaseCount('customers', 1);
+        $this->assertDatabaseCount('channel_identities', 1);
+        $this->assertDatabaseCount('conversations', $differentBusiness ? 2 : 1);
+        $this->assertSame(0, ConversationMessage::query()->where('role', 'assistant')->count());
+        $this->assertInstanceOf(ConversationMessage::class, $coordinator->complete($this->business, $claim, 'Welcome'));
+        if ($differentBusiness) {
+            $this->assertInstanceOf(ConversationMessage::class, $coordinator->complete($otherBusiness, $otherClaim, 'Welcome'));
+        }
+    }
+
+    public static function registrationScopes(): array
+    {
+        return [
+            'same participant serialized by ownership boundary' => [false],
+            'same identity across Businesses resolved after PostgreSQL unique conflict' => [true],
+        ];
+    }
+
+    public function test_stale_attempt_cannot_register_an_unidentified_contact(): void
+    {
+        $coordinator = app(AiTurnCoordinator::class);
+        $coordinator->inbound($this->business, 'whatsapp', 'sender', '1', 'Register me');
+        $claim = $coordinator->claimNext($this->business, 'whatsapp', 'sender', 60);
+        $takeover = $this->start('claim_customer', [], 'claim', '2030-01-01 12:01:00 UTC');
+        $this->assertSame("locked\n", $this->line($takeover));
+        $stale = $this->start('register_customer', $this->claimData($claim));
+        $this->assertBlocked($takeover, $stale);
+        $this->release($takeover);
+        $new = $this->finish($takeover);
+        $this->assertSame(['status' => 'not_authorized', 'reason' => 'StaleAttempt'], $this->finish($stale));
+        $this->assertDatabaseCount('customers', 0);
+        $this->assertDatabaseCount('channel_identities', 0);
+        $this->assertNull(Conversation::sole()->customer_id);
+        $recovered = $this->start('register_customer', [
+            'turn' => $new['id'], 'token' => $new['token'], 'inbound' => $claim->inboundMessage->id,
+        ]);
+        $this->assertSame('registered', $this->finish($recovered)['status']);
+        $this->assertDatabaseCount('customers', 1);
     }
 
     #[DataProvider('authorizedActions')]
@@ -308,9 +378,12 @@ class AiTurnConcurrencyTest extends TestCase
             if ($barrier === 'claim') {
                 App\Models\AiTurn::updating(fn () => $wait('locked'));
             }
+            if ($barrier === 'registration') {
+                App\Models\Conversation::updating(fn () => $wait('locked'));
+            }
             try {
-                $business = App\Models\Business::findOrFail($argv[1]);
                 $data = json_decode($argv[3], true, flags: JSON_THROW_ON_ERROR);
+                $business = App\Models\Business::findOrFail($data['business'] ?? $argv[1]);
                 $sender = $data['sender'] ?? 'sender';
                 $coordinator = app(App\Application\Conversation\AiTurnCoordinator::class);
                 if ($argv[2] === 'sdk_process') {
@@ -325,6 +398,13 @@ class AiTurnConcurrencyTest extends TestCase
                 $result = match ($argv[2]) {
                     'inbound' => $coordinator->inbound($business, 'web', $sender, $data['message'], 'hello'),
                     'claim' => $coordinator->claimNext($business, 'web', $sender),
+                    'claim_customer' => $coordinator->claimNext($business, 'whatsapp', $sender),
+                    'register_customer' => (new App\Application\Conversation\RegisterCustomerTool(
+                        $business, new App\Application\Conversation\AiTurnClaim(
+                            $data['turn'], $data['token'], App\Models\ConversationMessage::findOrFail($data['inbound'])
+                        ), $coordinator, new App\Application\Customer\ResolveCustomer,
+                        new App\Application\Customer\RegisterCustomer, new App\Application\Conversation\ConversationHandler,
+                    ))->handle(new Laravel\Ai\Tools\Request(['first_name' => 'Ana', 'last_name' => 'García'])),
                     'complete' => $coordinator->complete($business, new App\Application\Conversation\AiTurnClaim(
                         $data['turn'], $data['token'], App\Models\ConversationMessage::findOrFail($data['inbound'])
                     ), 'answer'),
@@ -355,6 +435,7 @@ class AiTurnConcurrencyTest extends TestCase
                 }
                 $output = match (true) {
                     is_array($result) => $result,
+                    is_string($result) => json_decode($result, true, flags: JSON_THROW_ON_ERROR),
                     $result instanceof App\Application\Conversation\AiTurnOutcome => ['kind' => 'outcome', 'name' => $result->name],
                     $result instanceof App\Application\Conversation\AiTurnClaim => ['kind' => 'claim', 'id' => $result->turnId, 'token' => $result->token],
                     $result instanceof App\Models\AiTurn => ['kind' => 'turn', 'id' => $result->id],
