@@ -33,7 +33,7 @@ class GetCustomerAppointmentsTest extends TestCase
         ]);
         $before = $appointment->fresh()->getAttributes();
 
-        $results = app(GetCustomerAppointments::class)->handle($customer->id);
+        $results = app(GetCustomerAppointments::class)->handle($business, $customer->id);
 
         $this->assertCount(1, $results);
         $item = $results[0];
@@ -60,7 +60,7 @@ class GetCustomerAppointmentsTest extends TestCase
         $tie = Appointment::factory()->for($customer)->for($service)->for($professional)->create(['starts_at' => '2030-07-01 10:00+00', 'ends_at' => '2030-07-01 11:00+00', 'status' => 'completed']);
         Appointment::factory()->for($other)->for($service)->for($professional)->create(['status' => 'cancelled']);
 
-        $results = app(GetCustomerAppointments::class)->handle($customer->id);
+        $results = app(GetCustomerAppointments::class)->handle($business, $customer->id);
 
         $this->assertSame([$tie->id, $future->id, $past->id], array_column($results, 'id'));
         $this->assertSame(['completed', 'cancelled', 'confirmed'], array_column($results, 'status'));
@@ -73,26 +73,66 @@ class GetCustomerAppointmentsTest extends TestCase
 
     public function test_empty_and_invalid_identity_outcomes_are_distinct(): void
     {
+        $business = Business::factory()->create();
         $customer = $this->registeredCustomer();
         $unregistered = Customer::factory()->create();
         $action = app(GetCustomerAppointments::class);
 
-        $this->assertSame([], $action->handle($customer->id));
-        $this->assertSame(GetCustomerAppointmentsOutcome::IdentificationFailed, $action->handle(null));
-        $this->assertSame(GetCustomerAppointmentsOutcome::IdentificationFailed, $action->handle(99999999));
-        $this->assertSame(GetCustomerAppointmentsOutcome::IdentificationFailed, $action->handle($unregistered->id));
+        $this->assertSame([], $action->handle($business, $customer->id));
+        $this->assertSame(GetCustomerAppointmentsOutcome::IdentificationFailed, $action->handle($business, null));
+        $this->assertSame(GetCustomerAppointmentsOutcome::IdentificationFailed, $action->handle($business, 99999999));
+        $this->assertSame(GetCustomerAppointmentsOutcome::IdentificationFailed, $action->handle($business, $unregistered->id));
+    }
+
+    public function test_same_customer_appointments_are_isolated_by_business_in_the_database_query(): void
+    {
+        $customer = $this->registeredCustomer();
+        $otherCustomer = $this->registeredCustomer();
+        $madrid = Business::factory()->create(['timezone' => 'Europe/Madrid']);
+        $newYork = Business::factory()->create(['timezone' => 'America/New_York']);
+        $madridService = Service::factory()->for($madrid)->create();
+        $newYorkService = Service::factory()->for($newYork)->create();
+        $madridAppointment = Appointment::factory()->for($customer)->for($madridService)->create();
+        $newYorkAppointment = Appointment::factory()->for($customer)->for($newYorkService)->create();
+        Appointment::factory()->for($otherCustomer)->for($madridService)->create(['status' => 'cancelled']);
+        Appointment::factory()->for($otherCustomer)->for($newYorkService)->create(['status' => 'completed']);
+        $action = app(GetCustomerAppointments::class);
+
+        DB::flushQueryLog();
+        DB::enableQueryLog();
+        try {
+            $results = $action->handle($madrid, $customer->id);
+            $queries = DB::getQueryLog();
+        } finally {
+            DB::disableQueryLog();
+        }
+
+        $this->assertSame([$madridAppointment->id], array_column($results, 'id'));
+        $this->assertSame('2030-01-01T11:00:00+01:00', $results[0]->starts_at->format('c'));
+        $appointmentQuery = collect($queries)->first(fn (array $query) => str_contains($query['query'], 'from "appointments"'));
+        $this->assertStringContainsString('"customer_id" = ?', $appointmentQuery['query']);
+        $this->assertStringContainsString('exists (select * from "services"', $appointmentQuery['query']);
+        $this->assertStringContainsString('"business_id" = ?', $appointmentQuery['query']);
+        $this->assertSame([$customer->id, $madrid->id], $appointmentQuery['bindings']);
+
+        $otherResults = $action->handle($newYork, $customer->id);
+        $this->assertSame([$newYorkAppointment->id], array_column($otherResults, 'id'));
+        $this->assertSame('2030-01-01T05:00:00-05:00', $otherResults[0]->starts_at->format('c'));
+        $this->assertSame([], $action->handle(Business::factory()->create(), $customer->id));
     }
 
     public function test_multiple_appointments_use_bounded_read_queries_without_writes(): void
     {
         $customer = $this->registeredCustomer();
+        $business = Business::factory()->create();
+        $service = Service::factory()->for($business)->create();
         for ($i = 0; $i < 12; $i++) {
-            Appointment::factory()->for($customer)->create(['status' => 'cancelled']);
+            Appointment::factory()->for($customer)->for($service)->create(['status' => 'cancelled']);
         }
         DB::flushQueryLog();
         DB::enableQueryLog();
 
-        $results = app(GetCustomerAppointments::class)->handle($customer->id);
+        $results = app(GetCustomerAppointments::class)->handle($business, $customer->id);
         $queries = DB::getQueryLog();
         DB::disableQueryLog();
 
@@ -105,6 +145,7 @@ class GetCustomerAppointmentsTest extends TestCase
 
     public function test_database_failure_is_not_converted_to_an_empty_result(): void
     {
+        $business = Business::factory()->create();
         $customer = $this->registeredCustomer();
         $throw = true;
         DB::listen(function (QueryExecuted $query) use (&$throw): void {
@@ -116,7 +157,7 @@ class GetCustomerAppointmentsTest extends TestCase
 
         $this->expectException(RuntimeException::class);
         $this->expectExceptionMessage('Persistence failure');
-        app(GetCustomerAppointments::class)->handle($customer->id);
+        app(GetCustomerAppointments::class)->handle($business, $customer->id);
     }
 
     public function test_lumina_configuration_is_used_for_appointment_information(): void
@@ -128,7 +169,7 @@ class GetCustomerAppointmentsTest extends TestCase
         $professional = $business->professionals()->where('first_name', 'Laura')->sole();
         Appointment::factory()->for($customer)->for($service)->for($professional)->create(['starts_at' => '2026-11-09 09:00+00', 'ends_at' => '2026-11-09 10:00+00']);
 
-        $results = app(GetCustomerAppointments::class)->handle($customer->id);
+        $results = app(GetCustomerAppointments::class)->handle($business, $customer->id);
 
         $this->assertSame('Deep facial cleansing', $results[0]->service_name);
         $this->assertSame('Laura Martín', $results[0]->professional_name);

@@ -100,22 +100,113 @@ class AiTurnConcurrencyTest extends TestCase
         $this->assertSame('claim', $this->finish($first)['kind']);
     }
 
-    public function test_takeover_fences_an_old_completion_waiting_on_the_participant_lock(): void
+    #[DataProvider('authorizedActions')]
+    public function test_takeover_fences_an_old_attempt_waiting_on_the_participant_lock(string $action): void
     {
         $coordinator = app(AiTurnCoordinator::class);
         $coordinator->inbound($this->business, 'web', 'sender', '1', 'hello');
         $old = $coordinator->claimNext($this->business, 'web', 'sender', 60);
         $takeover = $this->start('claim', [], 'claim', '2030-01-01 12:01:00 UTC');
         $this->assertSame("locked\n", $this->line($takeover));
-        $stale = $this->start('complete', $this->claimData($old), '', '2030-01-01 12:01:00 UTC');
+        $stale = $this->start($action, $this->claimData($old), '', '2030-01-01 12:01:00 UTC');
         $this->assertBlocked($takeover, $stale);
         $this->release($takeover);
         $new = $this->finish($takeover);
         $this->assertNotSame($old->token, $new['token']);
         $this->assertSame(['kind' => 'outcome', 'name' => 'StaleAttempt'], $this->finish($stale));
+        $this->assertDatabaseCount('customers', 0);
         $accepted = $this->start('complete', ['turn' => $new['id'], 'token' => $new['token'], 'inbound' => $old->inboundMessage->id]);
         $this->assertSame('message', $this->finish($accepted)['kind']);
         $this->assertSame(1, ConversationMessage::query()->where('role', 'assistant')->count());
+    }
+
+    public static function authorizedActions(): array
+    {
+        return ['response completion' => ['complete'], 'write callback' => ['write']];
+    }
+
+    public function test_write_callbacks_serialize_for_one_participant_without_blocking_another(): void
+    {
+        $coordinator = app(AiTurnCoordinator::class);
+        $coordinator->inbound($this->business, 'web', 'sender', '1', 'hello');
+        $claim = $coordinator->claimNext($this->business, 'web', 'sender');
+        $coordinator->inbound($this->business, 'web', 'other', '1', 'hello');
+        $otherClaim = $coordinator->claimNext($this->business, 'web', 'other');
+
+        $first = $this->start('write', $this->claimData($claim), 'write');
+        $this->assertSame("locked\n", $this->line($first));
+        $this->assertDatabaseCount('customers', 0);
+        $sameParticipant = $this->start('write', $this->claimData($claim));
+        $this->assertBlocked($first, $sameParticipant);
+        $independent = $this->start('write', $this->claimData($otherClaim));
+        $otherResult = $this->finish($independent);
+        $this->assertSame('write', $otherResult['kind']);
+        $this->assertSame($otherClaim->inboundMessage->conversation_id, $otherResult['conversation']);
+        $this->assertNull($otherResult['previous_customer']);
+        $this->assertDatabaseCount('customers', 1);
+        $this->release($first);
+        $firstResult = $this->finish($first);
+        $secondResult = $this->finish($sameParticipant);
+        $this->assertSame('write', $firstResult['kind']);
+        $this->assertSame('write', $secondResult['kind']);
+        $this->assertNull($firstResult['previous_customer']);
+        $this->assertSame($firstResult['customer'], $secondResult['previous_customer']);
+        $this->assertSame($secondResult['customer'], Conversation::findOrFail($claim->inboundMessage->conversation_id)->customer_id);
+        $this->assertDatabaseCount('customers', 3);
+        $this->assertSame(2, AiTurn::query()->where('state', AiTurnState::Processing)->count());
+        $this->assertSame(0, ConversationMessage::query()->where('role', 'assistant')->count());
+    }
+
+    public function test_claim_takeover_waits_for_an_already_authorized_write_to_commit(): void
+    {
+        $coordinator = app(AiTurnCoordinator::class);
+        $coordinator->inbound($this->business, 'web', 'sender', '1', 'hello');
+        $claim = $coordinator->claimNext($this->business, 'web', 'sender', 60);
+        $write = $this->start('write', $this->claimData($claim), 'write');
+        $this->assertSame("locked\n", $this->line($write));
+        $takeover = $this->start('claim', [], '', '2030-01-01 12:01:00 UTC');
+        $this->assertBlocked($write, $takeover);
+        $this->release($write);
+        $this->assertSame('write', $this->finish($write)['kind']);
+        $new = $this->finish($takeover);
+        $this->assertSame('claim', $new['kind']);
+        $this->assertNotSame($claim->token, $new['token']);
+        $stale = $this->start('write', $this->claimData($claim));
+        $this->assertSame(['kind' => 'outcome', 'name' => 'StaleAttempt'], $this->finish($stale));
+        $this->assertDatabaseCount('customers', 1);
+    }
+
+    #[DataProvider('replacementOrder')]
+    public function test_write_and_conversation_replacement_use_the_same_participant_lock(bool $replacementFirst): void
+    {
+        $coordinator = app(AiTurnCoordinator::class);
+        $turn = $coordinator->inbound($this->business, 'web', 'sender', '1', 'hello');
+        $claim = $coordinator->claimNext($this->business, 'web', 'sender');
+        $time = '2030-01-02 00:00:00 UTC';
+        $first = $this->start($replacementFirst ? 'inbound' : 'write', $replacementFirst ? ['message' => '2'] : $this->claimData($claim), $replacementFirst ? 'insert' : 'write', $time);
+        $this->assertSame("locked\n", $this->line($first));
+        $second = $this->start($replacementFirst ? 'write' : 'inbound', $replacementFirst ? $this->claimData($claim) : ['message' => '2'], '', $time);
+        $this->assertBlocked($first, $second);
+        $this->release($first);
+        $firstResult = $this->finish($first);
+        $secondResult = $this->finish($second);
+
+        if ($replacementFirst) {
+            $this->assertSame('turn', $firstResult['kind']);
+            $this->assertSame(['kind' => 'outcome', 'name' => 'Superseded'], $secondResult);
+            $this->assertSame(AiTurnState::Superseded, $turn->fresh()->state);
+            $this->assertDatabaseCount('customers', 0);
+        } else {
+            $this->assertSame('write', $firstResult['kind']);
+            $this->assertSame('turn', $secondResult['kind']);
+            $this->assertDatabaseCount('customers', 1);
+            $lateWrite = $this->start('write', $this->claimData($claim), '', $time);
+            $this->assertSame(['kind' => 'outcome', 'name' => 'Superseded'], $this->finish($lateWrite));
+            $this->assertDatabaseCount('customers', 1);
+        }
+        $this->assertDatabaseCount('conversations', 2);
+        $this->assertSame('2030-01-01 12:00:00', Conversation::findOrFail($claim->inboundMessage->conversation_id)->last_activity_at->format('Y-m-d H:i:s'));
+        $this->assertSame(0, ConversationMessage::query()->where('role', 'assistant')->count());
     }
 
     public function test_concurrent_completions_accept_only_one_assistant_message(): void
@@ -237,6 +328,16 @@ class AiTurnConcurrencyTest extends TestCase
                     'complete' => $coordinator->complete($business, new App\Application\Conversation\AiTurnClaim(
                         $data['turn'], $data['token'], App\Models\ConversationMessage::findOrFail($data['inbound'])
                     ), 'answer'),
+                    'write' => $coordinator->withOwnership($business, new App\Application\Conversation\AiTurnClaim(
+                        $data['turn'], $data['token'], App\Models\ConversationMessage::findOrFail($data['inbound'])
+                    ), function (App\Models\AiTurn $turn, App\Models\Conversation $conversation) use ($barrier, $wait): array {
+                        if (Illuminate\Support\Facades\DB::transactionLevel() !== 1) { throw new RuntimeException('Write outside bounded transaction'); }
+                        $previousCustomer = $conversation->customer_id;
+                        $customer = App\Models\Customer::factory()->create();
+                        $conversation->update(['customer_id' => $customer->id]);
+                        if ($barrier === 'write') { $wait('locked'); }
+                        return ['kind' => 'write', 'turn' => $turn->id, 'conversation' => $conversation->id, 'customer' => $customer->id, 'previous_customer' => $previousCustomer];
+                    }),
                     'process' => $coordinator->processNext($business, 'web', $sender, function () use ($barrier, $wait): string {
                         if (Illuminate\Support\Facades\DB::transactionLevel() !== 0) { throw new RuntimeException('Open provider transaction'); }
                         if ($barrier === 'generate') { $wait('generating'); }
@@ -253,6 +354,7 @@ class AiTurnConcurrencyTest extends TestCase
                     }
                 }
                 $output = match (true) {
+                    is_array($result) => $result,
                     $result instanceof App\Application\Conversation\AiTurnOutcome => ['kind' => 'outcome', 'name' => $result->name],
                     $result instanceof App\Application\Conversation\AiTurnClaim => ['kind' => 'claim', 'id' => $result->turnId, 'token' => $result->token],
                     $result instanceof App\Models\AiTurn => ['kind' => 'turn', 'id' => $result->id],

@@ -147,9 +147,19 @@ final class AiTurnCoordinator
             ->with(['inboundMessage', 'assistantMessage'])->orderBy('inbound_message_id')->get();
     }
 
-    private function withOwnership(Business $business, AiTurnClaim $claim, Closure $transition): AiTurn|ConversationMessage|AiTurnOutcome
+    /**
+     * Execute a bounded database operation under current claim ownership.
+     * The callback receives persisted context; provider calls must remain outside it.
+     * Lease expiry permits takeover, but only a new token or Conversation revokes ownership.
+     *
+     * @template TResult
+     *
+     * @param  Closure(AiTurn, Conversation): TResult  $operation
+     * @return TResult|AiTurnOutcome
+     */
+    public function withOwnership(Business $business, AiTurnClaim $claim, Closure $operation): mixed
     {
-        return DB::transaction(function () use ($business, $claim, $transition): AiTurn|ConversationMessage|AiTurnOutcome {
+        return DB::transaction(function () use ($business, $claim, $operation): mixed {
             $turn = AiTurn::query()->whereKey($claim->turnId)
                 ->whereHas('inboundMessage.conversation', fn (Builder $query) => $query->where('business_id', $business->id))->first();
             if (! $turn) {
@@ -157,8 +167,9 @@ final class AiTurnCoordinator
             }
             $conversation = $turn->inboundMessage->conversation;
             $this->lock->acquire($business->id, $conversation->channel, $conversation->sender_identity);
-            $turn->refresh();
-            if ($turn->state !== AiTurnState::Processing || $turn->claim_token !== $claim->token) {
+            $turn = AiTurn::query()->lockForUpdate()->findOrFail($turn->id);
+            if ($turn->state !== AiTurnState::Processing || $turn->claim_token !== $claim->token
+                || $turn->inbound_message_id !== $claim->inboundMessage->id) {
                 return AiTurnOutcome::StaleAttempt;
             }
             $current = $this->participant($business, $conversation->channel, $conversation->sender_identity)
@@ -169,7 +180,7 @@ final class AiTurnCoordinator
                 return AiTurnOutcome::Superseded;
             }
 
-            return $transition($turn, $conversation);
+            return $operation($turn, $current);
         });
     }
 

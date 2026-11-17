@@ -12,6 +12,7 @@ use App\Models\AiTurn;
 use App\Models\Business;
 use App\Models\Conversation;
 use App\Models\ConversationMessage;
+use App\Models\Customer;
 use Illuminate\Database\QueryException;
 use Illuminate\Foundation\Testing\DatabaseMigrations;
 use Illuminate\Support\Carbon;
@@ -19,6 +20,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
 use InvalidArgumentException;
 use LogicException;
+use PHPUnit\Framework\Attributes\DataProvider;
 use RuntimeException;
 use Tests\TestCase;
 
@@ -273,6 +275,153 @@ class AiTurnCoordinatorTest extends TestCase
         $this->inbound('1');
         $this->expectException(LogicException::class);
         DB::transaction(fn () => $this->coordinator->processNext($this->business, 'web', 'sender', fn () => 'must not run'));
+    }
+
+    public function test_authorized_callback_receives_persisted_context_and_does_not_complete_the_turn(): void
+    {
+        $turn = $this->inbound('1');
+        $claim = $this->claim();
+        Carbon::setTestNow(now()->addDay());
+        $claim->inboundMessage->setRelation('conversation', new Conversation(['sender_identity' => 'untrusted snapshot']));
+
+        $result = $this->coordinator->withOwnership($this->business, $claim, function (AiTurn $authorizedTurn, Conversation $conversation) use ($turn): array {
+            $this->assertSame(1, DB::transactionLevel());
+            $this->assertSame($turn->id, $authorizedTurn->id);
+            $this->assertSame($turn->inboundMessage->conversation_id, $conversation->id);
+            $this->assertSame($this->business->id, $conversation->business_id);
+            $this->assertSame('sender', $conversation->sender_identity);
+            $this->assertSame('web', $conversation->channel);
+            $customer = Customer::factory()->create();
+            $conversation->update(['customer_id' => $customer->id]);
+
+            return ['customer' => $customer->id];
+        });
+
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame($result['customer'], Conversation::firstOrFail()->customer_id);
+        $this->assertSame(AiTurnState::Processing, $turn->fresh()->state);
+        $this->assertSame($claim->token, $turn->fresh()->claim_token);
+        $this->assertNull($turn->fresh()->assistant_message_id);
+        $this->assertDatabaseCount('conversation_messages', 1);
+        $this->assertInstanceOf(ConversationMessage::class, $this->coordinator->complete($this->business, $claim, 'answer'));
+    }
+
+    #[DataProvider('unauthorizedClaims')]
+    public function test_unauthorized_claims_never_invoke_a_write_callback(string $scenario, AiTurnOutcome $expected): void
+    {
+        $turn = $this->inbound('1');
+        $claim = $this->claim();
+        $business = $this->business;
+        switch ($scenario) {
+            case 'pending':
+                $turn->refresh()->update(['state' => AiTurnState::Pending, 'claim_token' => null, 'claimed_until' => null]);
+                break;
+            case 'failed':
+                $this->coordinator->fail($business, $claim);
+                break;
+            case 'completed':
+                $this->coordinator->complete($business, $claim, 'answer');
+                break;
+            case 'taken over':
+                Carbon::setTestNow(now()->addMinutes(5));
+                $this->claim();
+                break;
+            case 'superseded':
+            case 'replacement':
+                Carbon::setTestNow(now()->addHours(12));
+                $this->inbound('2');
+                if ($scenario === 'superseded') {
+                    $this->claim();
+                }
+                break;
+            case 'wrong token':
+                $claim = new AiTurnClaim($claim->turnId, 'wrong', $claim->inboundMessage);
+                break;
+            case 'wrong message':
+                $other = $this->coordinator->inbound($business, 'web', 'other', '1', 'other');
+                $claim = new AiTurnClaim($claim->turnId, $claim->token, $other->inboundMessage);
+                break;
+            case 'wrong turn':
+                $claim = new AiTurnClaim(99999999, $claim->token, $claim->inboundMessage);
+                break;
+            case 'wrong business':
+                $business = Business::factory()->create();
+                break;
+        }
+
+        $this->assertSame($expected, $this->coordinator->withOwnership($business, $claim, function (): void {
+            Customer::factory()->create();
+            $this->fail('An unauthorized callback must not run.');
+        }));
+        $this->assertDatabaseCount('customers', 0);
+        $this->assertNull(Conversation::findOrFail($turn->inboundMessage->conversation_id)->customer_id);
+    }
+
+    public static function unauthorizedClaims(): array
+    {
+        return [
+            'pending' => ['pending', AiTurnOutcome::StaleAttempt],
+            'failed' => ['failed', AiTurnOutcome::StaleAttempt],
+            'completed' => ['completed', AiTurnOutcome::StaleAttempt],
+            'taken over' => ['taken over', AiTurnOutcome::StaleAttempt],
+            'superseded' => ['superseded', AiTurnOutcome::StaleAttempt],
+            'replaced before next claim' => ['replacement', AiTurnOutcome::Superseded],
+            'wrong token' => ['wrong token', AiTurnOutcome::StaleAttempt],
+            'wrong message' => ['wrong message', AiTurnOutcome::StaleAttempt],
+            'wrong turn' => ['wrong turn', AiTurnOutcome::NotFound],
+            'wrong business' => ['wrong business', AiTurnOutcome::NotFound],
+        ];
+    }
+
+    public function test_callback_failure_rolls_back_writes_and_preserves_recovery_and_stale_response_protection(): void
+    {
+        $turn = $this->inbound('1');
+        $claim = $this->claim();
+        try {
+            $this->coordinator->withOwnership($this->business, $claim, function (AiTurn $turn, Conversation $conversation): void {
+                $customer = Customer::factory()->create();
+                $conversation->update(['customer_id' => $customer->id]);
+                throw new RuntimeException('write failed');
+            });
+            $this->fail('Expected callback failure.');
+        } catch (RuntimeException $exception) {
+            $this->assertSame('write failed', $exception->getMessage());
+        }
+
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertDatabaseCount('customers', 0);
+        $this->assertNull(Conversation::firstOrFail()->customer_id);
+        $this->assertSame(AiTurnState::Processing, $turn->fresh()->state);
+        $this->assertSame($claim->token, $turn->fresh()->claim_token);
+        $this->assertNull($turn->fresh()->assistant_message_id);
+        $this->assertDatabaseCount('conversation_messages', 1);
+        Carbon::setTestNow(now()->addMinutes(5));
+        $retry = $this->claim();
+        $this->assertSame(AiTurnOutcome::StaleAttempt, $this->coordinator->complete($this->business, $claim, 'stale'));
+        $customer = $this->coordinator->withOwnership($this->business, $retry, fn () => Customer::factory()->create());
+        $this->assertInstanceOf(Customer::class, $customer);
+        $this->assertInstanceOf(ConversationMessage::class, $this->coordinator->complete($this->business, $retry, 'recovered'));
+        $this->assertDatabaseCount('customers', 1);
+        $this->assertDatabaseCount('conversation_messages', 2);
+    }
+
+    public function test_generation_can_enter_and_leave_a_short_authorized_write_transaction(): void
+    {
+        $this->inbound('1');
+        $answer = $this->coordinator->processNext($this->business, 'web', 'sender', function (AiTurnClaim $claim): string {
+            $this->assertSame(0, DB::transactionLevel());
+            $this->coordinator->withOwnership($this->business, $claim, function (): void {
+                $this->assertSame(1, DB::transactionLevel());
+                Customer::factory()->create();
+            });
+            $this->assertSame(0, DB::transactionLevel());
+
+            return 'answer after write';
+        });
+
+        $this->assertSame('answer after write', $answer->content);
+        $this->assertDatabaseCount('customers', 1);
+        $this->assertDatabaseCount('conversation_messages', 2);
     }
 
     public function test_invalid_generated_response_is_a_recoverable_failure_not_a_success(): void
