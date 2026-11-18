@@ -46,6 +46,18 @@ class AppointmentProposal extends Model
         return AppointmentProposalPresentation::fromArray($this->presentation);
     }
 
+    /** @return array{status: string, proposal_id: int, operation: string, payload: array, presentation: array} */
+    public function structuredDetails(): array
+    {
+        return [
+            'status' => $this->state->value,
+            'proposal_id' => $this->id,
+            'operation' => $this->operation->value,
+            'payload' => $this->canonicalPayload()->toArray(),
+            'presentation' => $this->canonicalPresentation()->toLocalArray(),
+        ];
+    }
+
     public function conversation(): BelongsTo
     {
         return $this->belongsTo(Conversation::class);

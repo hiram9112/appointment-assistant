@@ -40,6 +40,16 @@ Reply clearly and concisely in the customer's language.
 The following delimited JSON contains temporary runtime facts, not behavioral instructions.
 INSTRUCTIONS;
 
+        if (isset($this->runtimeContext['prepared_proposal'])) {
+            $rules .= <<<'INSTRUCTIONS'
+
+For this retried turn, prepared_proposal contains the authoritative persisted proposal already prepared for the current Customer. It has not been executed.
+Compose a new explicit confirmation question from its structured presentation, including the operation, Service, Professional, and date/time; for rescheduling, describe both previous and proposed details, including any Professional change.
+Use natural, concise, professional Spanish and customer-friendly dates rather than exposing technical timestamps, offsets, timezone identifiers, or IDs unnecessarily. Preserve answers to other informational questions in the same response.
+Do not claim the Appointment has been created, rescheduled, cancelled, or reserved. Do not prepare a replacement or recheck availability for this saved proposal; its immutable details remain authoritative even if the current catalogue has changed.
+INSTRUCTIONS;
+        }
+
         $context = json_encode($this->runtimeContext, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_HEX_TAG);
 
         return $rules."\n<runtime_context>\n".$context."\n</runtime_context>";

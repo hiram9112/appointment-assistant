@@ -392,6 +392,63 @@ class AiTurnConcurrencyTest extends TestCase
         return ['same parameters' => [false], 'different parameters' => [true]];
     }
 
+    public function test_confirmation_request_and_promotion_commit_together_under_overlapping_completions(): void
+    {
+        $coordinator = app(AiTurnCoordinator::class);
+        $coordinator->inbound($this->business, 'web', 'sender', '1', 'Book');
+        $claim = $coordinator->claimNext($this->business, 'web', 'sender');
+        $data = $this->proposalData();
+        $proposal = app(AppointmentProposals::class)->prepare($this->business, $claim,
+            AppointmentProposalPayload::fromArray(AppointmentProposalOperation::Create, $data['payload']),
+            AppointmentProposalPresentation::fromArray($data['presentation']));
+        $generated = 'La consulta cuesta 45 €. ¿Confirmas la cita con Laura para el 1 de febrero a las once?';
+        $first = $this->start('complete', [...$this->claimData($claim), 'content' => $generated], 'promotion');
+        $this->assertSame("locked\n", $this->line($first));
+        $this->assertSame(AppointmentProposalState::Prepared, $proposal->fresh()->state);
+        $this->assertNull($proposal->fresh()->confirmation_request_message_id);
+        $this->assertSame(AiTurnState::Processing, AiTurn::findOrFail($claim->turnId)->state);
+        $this->assertDatabaseCount('conversation_messages', 1);
+        $second = $this->start('complete', [...$this->claimData($claim), 'content' => '¿Quieres reservar esta otra propuesta?']);
+        $this->assertBlocked($first, $second);
+        $this->release($first);
+        $result = $this->finish($first);
+        $this->assertSame('message', $result['kind']);
+        $this->assertSame(['kind' => 'outcome', 'name' => 'StaleAttempt'], $this->finish($second));
+        $this->assertSame(AppointmentProposalState::Pending, $proposal->fresh()->state);
+        $this->assertSame($result['id'], $proposal->fresh()->confirmation_request_message_id);
+        $this->assertSame($result['id'], AiTurn::findOrFail($claim->turnId)->assistant_message_id);
+        $this->assertSame($generated, ConversationMessage::findOrFail($result['id'])->content);
+        $this->assertDatabaseCount('conversation_messages', 2);
+        $this->assertDatabaseCount('appointments', 0);
+        $this->assertDatabaseCount('appointment_audits', 0);
+    }
+
+    public function test_claim_takeover_prevents_stale_generator_from_promoting_prepared_proposal(): void
+    {
+        $coordinator = app(AiTurnCoordinator::class);
+        $coordinator->inbound($this->business, 'web', 'sender', '1', 'Book');
+        $claim = $coordinator->claimNext($this->business, 'web', 'sender');
+        $data = $this->proposalData();
+        $proposal = app(AppointmentProposals::class)->prepare($this->business, $claim,
+            AppointmentProposalPayload::fromArray(AppointmentProposalOperation::Create, $data['payload']),
+            AppointmentProposalPresentation::fromArray($data['presentation']));
+        $takeover = $this->start('claim', [], 'claim', '2030-01-01 12:05:00 UTC');
+        $this->assertSame("locked\n", $this->line($takeover));
+        $stale = $this->start('complete', $this->claimData($claim));
+        $this->assertBlocked($takeover, $stale);
+        $this->release($takeover);
+        $newClaim = $this->finish($takeover);
+        $this->assertSame('claim', $newClaim['kind']);
+        $this->assertSame(['kind' => 'outcome', 'name' => 'StaleAttempt'], $this->finish($stale));
+        $this->assertSame(AppointmentProposalState::Prepared, $proposal->fresh()->state);
+        $this->assertNull($proposal->fresh()->confirmation_request_message_id);
+        $this->assertDatabaseCount('conversation_messages', 1);
+        $current = $this->start('complete', ['turn' => $newClaim['id'], 'token' => $newClaim['token'], 'inbound' => $claim->inboundMessage->id]);
+        $this->assertSame('message', $this->finish($current)['kind']);
+        $this->assertSame(AppointmentProposalState::Pending, $proposal->fresh()->state);
+        $this->assertDatabaseCount('appointment_proposals', 1);
+    }
+
     public function test_replacement_blocks_authorized_lookup_until_only_the_new_proposal_is_active(): void
     {
         $coordinator = app(AiTurnCoordinator::class);
@@ -480,9 +537,12 @@ class AiTurnConcurrencyTest extends TestCase
             if ($barrier === 'registration') {
                 App\Models\Conversation::updating(fn () => $wait('locked'));
             }
-            if ($barrier === 'proposal') {
-                App\Models\AppointmentProposal::created(fn () => $wait('locked'));
-            }
+             if ($barrier === 'proposal') {
+                 App\Models\AppointmentProposal::created(fn () => $wait('locked'));
+             }
+             if ($barrier === 'promotion') {
+                 App\Models\AppointmentProposal::updated(fn () => $wait('locked'));
+             }
             try {
                 $data = json_decode($argv[3], true, flags: JSON_THROW_ON_ERROR);
                 $business = App\Models\Business::findOrFail($data['business'] ?? $argv[1]);
@@ -531,7 +591,7 @@ class AiTurnConcurrencyTest extends TestCase
                     ))->handle(new Laravel\Ai\Tools\Request(['first_name' => 'Ana', 'last_name' => 'García'])),
                     'complete' => $coordinator->complete($business, new App\Application\Conversation\AiTurnClaim(
                         $data['turn'], $data['token'], App\Models\ConversationMessage::findOrFail($data['inbound'])
-                    ), 'answer'),
+                     ), $data['content'] ?? 'answer'),
                     'write' => $coordinator->withOwnership($business, new App\Application\Conversation\AiTurnClaim(
                         $data['turn'], $data['token'], App\Models\ConversationMessage::findOrFail($data['inbound'])
                     ), function (App\Models\AiTurn $turn, App\Models\Conversation $conversation) use ($barrier, $wait): array {

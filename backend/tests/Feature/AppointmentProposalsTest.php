@@ -5,6 +5,7 @@ namespace Tests\Feature;
 use App\Application\Conversation\AiTurnClaim;
 use App\Application\Conversation\AiTurnCoordinator;
 use App\Application\Conversation\AiTurnOutcome;
+use App\Application\Conversation\AiTurnState;
 use App\Application\Conversation\AppointmentProposalOperation;
 use App\Application\Conversation\AppointmentProposalOutcome;
 use App\Application\Conversation\AppointmentProposalPayload;
@@ -395,12 +396,20 @@ class AppointmentProposalsTest extends TestCase
         return $proposal;
     }
 
-    /** Task 3 tests persistence transitions only; S11 acceptance integration belongs to Task 4. */
+    /** Task 3 replacement fixtures include an unpresented proposal; real completion now always presents it. */
     private function nextTurn(AppointmentProposal $proposal, string $state): void
     {
-        $prompt = $this->turns->complete($this->business, $this->claim, 'Confirm this Appointment?');
         if ($state === 'pending') {
-            $proposal->update(['state' => 'pending', 'confirmation_request_message_id' => $prompt->id]);
+            $generated = '¿Confirmas esta propuesta de cita?';
+            $message = $this->turns->complete($this->business, $this->claim, $generated);
+            $this->assertSame($generated, $message->fresh()->content);
+            $this->assertSame($message->id, $proposal->fresh()->confirmation_request_message_id);
+        } else {
+            $message = $proposal->conversation->messages()->create(['role' => 'assistant', 'content' => 'Fixture response without presentation']);
+            AiTurn::findOrFail($this->claim->turnId)->update([
+                'state' => AiTurnState::Completed, 'assistant_message_id' => $message->id,
+                'completed_at' => now(), 'claim_token' => null, 'claimed_until' => null,
+            ]);
         }
         $this->turns->inbound($this->business, 'whatsapp', 'sender', 'next-'.AiTurn::query()->count(), 'A subsequent Customer response');
         $this->claim = $this->turns->claimNext($this->business, 'whatsapp', 'sender');

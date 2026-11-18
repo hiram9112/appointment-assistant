@@ -5,7 +5,6 @@ namespace App\Application\Conversation;
 use App\Application\Availability\GetAppointmentAvailability;
 use App\Application\Availability\ProfessionalAvailability;
 use App\Models\Business;
-use DateTimeImmutable;
 use DateTimeZone;
 use Illuminate\Contracts\JsonSchema\JsonSchema;
 use Illuminate\JsonSchema\Types\Type;
@@ -59,8 +58,8 @@ final class CheckAvailabilityTool implements Tool
                 'to' => ['required', 'string', 'max:25'],
             ]);
             $zone = new DateTimeZone($business->timezone);
-            $from = $this->timestamp($arguments['from'], $zone, 'from');
-            $to = $this->timestamp($arguments['to'], $zone, 'to');
+            $from = (new BusinessLocalTimestamp)->parse($arguments['from'], $zone, 'from');
+            $to = (new BusinessLocalTimestamp)->parse($arguments['to'], $zone, 'to');
             if ($from > $to || $to > $from->modify('+'.self::MaxRangeDays.' days')) {
                 throw ValidationException::withMessages(['to' => 'The inclusive start range must be ordered and span at most 31 local calendar days.']);
             }
@@ -120,21 +119,6 @@ final class CheckAvailabilityTool implements Tool
             'from' => $schema->string()->format('date-time')->max(25)->description('Inclusive earliest start, YYYY-MM-DDTHH:MM:SS±HH:MM in the Business timezone (Z allowed for UTC).')->required(),
             'to' => $schema->string()->format('date-time')->max(25)->description('Inclusive latest start in the same format; at or after from and no more than 31 local calendar days later. Equal to from for an exact start.')->required(),
         ];
-    }
-
-    private function timestamp(string $value, DateTimeZone $zone, string $field): DateTimeImmutable
-    {
-        $value = preg_replace('/Z$/', '+00:00', $value);
-        if (! preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/D', $value)) {
-            throw ValidationException::withMessages([$field => 'Use YYYY-MM-DDTHH:MM:SS with an explicit UTC offset in the Business timezone.']);
-        }
-        $instant = DateTimeImmutable::createFromFormat('!Y-m-d\TH:i:sP', $value);
-        $errors = DateTimeImmutable::getLastErrors();
-        if ($instant === false || $errors !== false || $instant->format(DATE_ATOM) !== $value || $instant->setTimezone($zone)->format(DATE_ATOM) !== $value) {
-            throw ValidationException::withMessages([$field => 'Use a valid Business-local timestamp with seconds and an explicit UTC offset matching the Business timezone.']);
-        }
-
-        return $instant->setTimezone($zone);
     }
 
     /** @return array{id: int, display_name: string, eligible: bool, ranges: list<array{earliest: string, latest: string}>} */

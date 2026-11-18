@@ -36,6 +36,17 @@ final readonly class AppointmentProposalPresentation
         ];
     }
 
+    /** @return array{service_name: string, professional_name: string, starts_at: string, ends_at: string, timezone: string, previous: ?array} */
+    public function toLocalArray(): array
+    {
+        return [
+            ...$this->toArray(),
+            'starts_at' => $this->startsAt->setTimezone($this->timezone)->toIso8601String(),
+            'ends_at' => $this->endsAt->setTimezone($this->timezone)->toIso8601String(),
+            'previous' => $this->previous?->toLocalArray(),
+        ];
+    }
+
     /** @param array{service_name: string, professional_name: string, starts_at: string, ends_at: string, timezone: string, previous: ?array} $details */
     public static function fromArray(array $details): self
     {

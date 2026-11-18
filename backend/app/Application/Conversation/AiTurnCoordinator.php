@@ -3,6 +3,7 @@
 namespace App\Application\Conversation;
 
 use App\Models\AiTurn;
+use App\Models\AppointmentProposal;
 use App\Models\Business;
 use App\Models\Conversation;
 use App\Models\ConversationMessage;
@@ -90,6 +91,8 @@ final class AiTurnCoordinator
     public function complete(Business $business, AiTurnClaim $claim, string $content): ConversationMessage|AiTurnOutcome
     {
         return $this->withOwnership($business, $claim, function (AiTurn $turn, Conversation $conversation) use ($business, $content): ConversationMessage {
+            $proposal = AppointmentProposal::query()->where('conversation_id', $conversation->id)
+                ->where('originating_turn_id', $turn->id)->lockForUpdate()->first();
             $message = $this->conversations->assistant($business, $conversation->id, $content);
             if (! $message instanceof ConversationMessage) {
                 throw new LogicException('The claimed Conversation disappeared during completion.');
@@ -98,6 +101,12 @@ final class AiTurnCoordinator
                 'state' => AiTurnState::Completed, 'assistant_message_id' => $message->id,
                 'completed_at' => now(), 'claim_token' => null, 'claimed_until' => null,
             ]);
+            if ($proposal?->state === AppointmentProposalState::Prepared) {
+                $proposal->update([
+                    'state' => AppointmentProposalState::Pending,
+                    'confirmation_request_message_id' => $message->id,
+                ]);
+            }
 
             return $message;
         });
