@@ -41,8 +41,15 @@ final class PrepareAppointmentProposal
                 } catch (ValidationException) {
                     return ['status' => 'identification_failed'];
                 }
-                if ($customer === null) {
+                if ($customer === null || ($conversation->customer_id !== null && $conversation->customer_id !== $customer->id)) {
                     return ['status' => 'identification_failed'];
+                }
+                if ($conversation->customer_id === null) {
+                    if (AppointmentProposal::query()->where('conversation_id', $conversation->id)->exists()) {
+                        return ['status' => 'identification_failed'];
+                    }
+                    $conversation->customer()->associate($customer);
+                    $conversation->save();
                 }
                 $business = Business::query()->findOrFail($business->id);
                 $idRule = ['integer:strict', 'min:1', 'max:'.PHP_INT_MAX];

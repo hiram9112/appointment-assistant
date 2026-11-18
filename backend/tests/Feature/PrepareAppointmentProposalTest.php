@@ -22,6 +22,7 @@ use App\Models\AppointmentProposal;
 use App\Models\Business;
 use App\Models\BusinessOperatingHour;
 use App\Models\ChannelIdentity;
+use App\Models\Conversation;
 use App\Models\ConversationMessage;
 use App\Models\Customer;
 use App\Models\Professional;
@@ -81,6 +82,7 @@ class PrepareAppointmentProposalTest extends TestCase
         $proposal = AppointmentProposal::sole();
 
         $this->assertSame('prepared', $result['status']);
+        $this->assertSame($this->customer->id, $proposal->conversation->customer_id);
         $this->assertSame('create', $result['operation']);
         $this->assertSame($this->presentation(), $result['presentation']);
         $this->assertProposalDetails($result, $proposal);
@@ -93,6 +95,70 @@ class PrepareAppointmentProposalTest extends TestCase
         $this->assertDatabaseCount('appointments', 0);
         $this->assertDatabaseCount('appointment_audits', 0);
         $this->assertDatabaseCount('conversation_messages', 1);
+    }
+
+    public function test_preparation_retry_cannot_rebind_a_proposal_after_channel_identity_reassignment(): void
+    {
+        $prepared = $this->create();
+        $proposal = AppointmentProposal::sole();
+        $before = $proposal->getAttributes();
+        $other = Customer::factory()->create();
+        ChannelIdentity::query()->where('external_id', 'sender')->update(['customer_id' => $other->id]);
+
+        $this->assertSame(['status' => 'identification_failed'], $this->create());
+        $this->assertSame($this->customer->id, $proposal->conversation->fresh()->customer_id);
+        $this->assertSame($before, $proposal->fresh()->getAttributes());
+        $this->assertDatabaseCount('appointments', 0);
+        ChannelIdentity::query()->where('external_id', 'sender')->update(['customer_id' => $this->customer->id]);
+        $this->turns->fail($this->business, $this->claim);
+        $this->claim = $this->turns->claimNext($this->business, 'whatsapp', 'sender');
+        $this->preventAvailabilityRecalculation();
+        $this->assertSame($prepared, $this->create());
+        $this->assertSame($before, $proposal->fresh()->getAttributes());
+    }
+
+    #[DataProvider('associationFailures')]
+    public function test_customer_association_and_proposal_persistence_roll_back_together(string $model): void
+    {
+        $conversation = $this->claim->inboundMessage->conversation;
+        $before = $conversation->getAttributes();
+        $model::saved(function () use ($conversation): void {
+            $this->assertGreaterThan(0, DB::transactionLevel());
+            $this->assertSame($this->customer->id, $conversation->fresh()->customer_id);
+            throw new RuntimeException('Association or proposal persistence failed');
+        });
+        try {
+            $this->create();
+            $this->fail('The association and proposal must roll back together.');
+        } catch (RuntimeException $exception) {
+            $this->assertSame('Association or proposal persistence failed', $exception->getMessage());
+        } finally {
+            $model::flushEventListeners();
+        }
+        $this->assertSame(0, DB::transactionLevel());
+        $this->assertSame($before, $conversation->fresh()->getAttributes());
+        $this->assertDatabaseCount('appointment_proposals', 0);
+        $this->assertDatabaseCount('appointments', 0);
+        $this->assertSame('prepared', $this->create()['status']);
+        $this->assertSame($this->customer->id, $conversation->fresh()->customer_id);
+    }
+
+    public static function associationFailures(): array
+    {
+        return ['association save' => [Conversation::class], 'proposal save' => [AppointmentProposal::class]];
+    }
+
+    public function test_stale_preparation_cannot_establish_a_customer_association(): void
+    {
+        $stale = $this->claim;
+        $this->travel(5)->minutes();
+        $this->claim = $this->turns->claimNext($this->business, 'whatsapp', 'sender');
+        $tool = app()->makeWith(PrepareCreateAppointmentTool::class, ['business' => $this->business, 'claim' => $stale]);
+        $this->assertSame('not_authorized', json_decode($tool->handle(new Request($this->createArguments())), true)['status']);
+        $this->assertNull($this->claim->inboundMessage->conversation->customer_id);
+        $this->assertDatabaseCount('appointment_proposals', 0);
+        $this->assertSame('prepared', $this->create()['status']);
+        $this->assertSame($this->customer->id, $this->claim->inboundMessage->conversation->fresh()->customer_id);
     }
 
     #[DataProvider('missingOrAmbiguousReferences')]

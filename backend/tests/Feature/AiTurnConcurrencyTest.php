@@ -10,12 +10,15 @@ use App\Application\Conversation\AppointmentProposalPayload;
 use App\Application\Conversation\AppointmentProposalPresentation;
 use App\Application\Conversation\AppointmentProposals;
 use App\Application\Conversation\AppointmentProposalState;
+use App\Application\Conversation\PrepareAppointmentProposal;
 use App\Models\AiTurn;
+use App\Models\Appointment;
 use App\Models\AppointmentProposal;
 use App\Models\Business;
 use App\Models\ChannelIdentity;
 use App\Models\Conversation;
 use App\Models\ConversationMessage;
+use App\Models\Customer;
 use App\Models\Professional;
 use App\Models\Service;
 use Carbon\CarbonImmutable;
@@ -508,6 +511,178 @@ class AiTurnConcurrencyTest extends TestCase
         ];
     }
 
+    public function test_concurrent_confirmations_of_the_same_claim_return_one_committed_result_and_audit(): void
+    {
+        [$claim, $proposal, $appointment] = $this->confirmation();
+        $first = $this->start('confirm_proposal', $this->claimData($claim), 'execution');
+        $this->assertSame("locked\n", $this->line($first));
+        $this->assertSame('confirmed', $appointment->fresh()->status);
+        $this->assertNull($proposal->fresh()->result);
+        $second = $this->start('confirm_proposal', $this->claimData($claim));
+        $this->assertBlocked($first, $second);
+        $this->release($first);
+        $result = $this->finish($first);
+        $this->assertSame($result, $this->finish($second));
+        $this->assertSame('cancelled', $result['outcome']);
+        $this->assertSame($result, $proposal->fresh()->result);
+        $this->assertSame('cancelled', $appointment->fresh()->status);
+        $this->assertDatabaseCount('appointment_audits', 1);
+    }
+
+    public function test_identity_reassignment_cannot_transfer_ownership_through_registration_waiting_on_execution(): void
+    {
+        [$claim, $proposal, $appointment] = $this->confirmation();
+        $customerId = $appointment->customer_id;
+        $first = $this->start('confirm_proposal', $this->claimData($claim), 'execution');
+        $this->assertSame("locked\n", $this->line($first));
+        $other = Customer::factory()->create();
+        ChannelIdentity::query()->where('external_id', 'sender')->update(['customer_id' => $other->id]);
+        $registration = $this->start('register_customer', $this->claimData($claim));
+        $this->assertBlocked($first, $registration);
+        $this->release($first);
+
+        $result = $this->finish($first);
+        $this->assertSame('completed', $result['status']);
+        $this->assertSame($customerId, $result['customer_id']);
+        $this->assertSame(['status' => 'identification_failed'], $this->finish($registration));
+        $this->assertSame($customerId, $proposal->conversation->fresh()->customer_id);
+        $this->assertSame($customerId, $appointment->fresh()->customer_id);
+        $this->assertSame($result, $proposal->fresh()->result);
+        $this->assertDatabaseCount('appointment_audits', 1);
+    }
+
+    public function test_claim_takeover_fences_a_confirmation_waiting_on_participant_ownership(): void
+    {
+        [$claim, $proposal] = $this->confirmation();
+        $takeover = $this->start('claim_customer', [], 'claim', '2030-01-01 12:05:00 UTC');
+        $this->assertSame("locked\n", $this->line($takeover));
+        $stale = $this->start('confirm_proposal', $this->claimData($claim));
+        $this->assertBlocked($takeover, $stale);
+        $this->release($takeover);
+        $new = $this->finish($takeover);
+        $this->assertSame(['status' => 'not_authorized', 'reason' => 'StaleAttempt'], $this->finish($stale));
+        $this->assertSame(AppointmentProposalState::Pending, $proposal->fresh()->state);
+        $this->assertDatabaseCount('appointment_audits', 0);
+        $current = $this->start('confirm_proposal', [
+            'turn' => $new['id'], 'token' => $new['token'], 'inbound' => $claim->inboundMessage->id,
+        ]);
+        $this->assertSame('cancelled', $this->finish($current)['outcome']);
+        $this->assertDatabaseCount('appointment_audits', 1);
+    }
+
+    public function test_already_authorized_confirmation_commits_before_takeover_and_is_recovered_without_reexecution(): void
+    {
+        [$claim, $proposal] = $this->confirmation();
+        $first = $this->start('confirm_proposal', $this->claimData($claim), 'execution');
+        $this->assertSame("locked\n", $this->line($first));
+        $takeover = $this->start('claim_customer', [], '', '2030-01-01 12:05:00 UTC');
+        $this->assertBlocked($first, $takeover);
+        $this->release($first);
+        $result = $this->finish($first);
+        $new = $this->finish($takeover);
+        $retry = $this->start('confirm_proposal', [
+            'turn' => $new['id'], 'token' => $new['token'], 'inbound' => $claim->inboundMessage->id,
+        ]);
+        $this->assertSame($result, $this->finish($retry));
+        $this->assertSame($result, $proposal->fresh()->result);
+        $this->assertDatabaseCount('appointment_audits', 1);
+    }
+
+    public function test_conversation_replacement_fences_a_waiting_confirmation(): void
+    {
+        [$claim, $proposal, $appointment] = $this->confirmation();
+        $replacement = $this->start('inbound_customer', ['message' => 'new'], 'insert', '2030-01-02 12:00:00 UTC');
+        $this->assertSame("locked\n", $this->line($replacement));
+        $old = $this->start('confirm_proposal', $this->claimData($claim));
+        $this->assertBlocked($replacement, $old);
+        $this->release($replacement);
+        $this->finish($replacement);
+        $this->assertSame(['status' => 'not_authorized', 'reason' => 'Superseded'], $this->finish($old));
+        $this->assertNull($proposal->fresh()->result);
+        $this->assertSame('confirmed', $appointment->fresh()->status);
+        $this->assertDatabaseCount('appointment_audits', 0);
+    }
+
+    public function test_independent_participant_can_execute_while_another_confirmation_is_uncommitted(): void
+    {
+        [$claim] = $this->confirmation();
+        [$other] = $this->confirmation('other');
+        $first = $this->start('confirm_proposal', $this->claimData($claim), 'execution');
+        $this->assertSame("locked\n", $this->line($first));
+        $independent = $this->start('confirm_proposal', $this->claimData($other));
+        $this->assertSame('completed', $this->finish($independent)['status']);
+        $this->assertDatabaseCount('appointment_audits', 1);
+        $this->release($first);
+        $this->assertSame('completed', $this->finish($first)['status']);
+        $this->assertDatabaseCount('appointment_audits', 2);
+    }
+
+    public function test_real_postgresql_deadlock_rolls_back_one_entire_execution_and_allows_turn_retry(): void
+    {
+        [$claim, $firstProposal] = $this->confirmation();
+        [$other, $otherProposal] = $this->confirmation('other');
+        $first = $this->start('confirm_proposal', [...$this->claimData($claim), 'locks' => [912001, 912002]], 'deadlock');
+        $this->assertSame("locked\n", $this->line($first));
+        $second = $this->start('confirm_proposal', [...$this->claimData($other), 'locks' => [912002, 912001]], 'deadlock');
+        $this->assertSame("locked\n", $this->line($second));
+        $this->release($first);
+        $this->release($second);
+        $results = [$this->finish($first), $this->finish($second)];
+        $failedIndex = isset($results[0]['technical_error']) ? 0 : 1;
+        $this->assertSame(['technical_error' => '40P01'], $results[$failedIndex]);
+        $this->assertSame('completed', $results[1 - $failedIndex]['status']);
+        $proposal = [$firstProposal, $otherProposal][$failedIndex];
+        $this->assertSame(AppointmentProposalState::Pending, $proposal->fresh()->state);
+        $this->assertNull($proposal->fresh()->result);
+        $this->assertDatabaseCount('appointment_audits', 1);
+        $retry = $this->start('confirm_proposal', $this->claimData([$claim, $other][$failedIndex]));
+        $this->assertSame('completed', $this->finish($retry)['status']);
+        $this->assertDatabaseCount('appointment_audits', 2);
+    }
+
+    public function test_real_serializable_snapshot_conflict_leaves_confirmation_retryable_without_a_result(): void
+    {
+        [$claim, $proposal, $appointment] = $this->confirmation();
+        $change = $this->start('change_appointment', [...$this->claimData($claim), 'appointment' => $appointment->id], 'write');
+        $this->assertSame("locked\n", $this->line($change));
+        $confirmation = $this->start('confirm_proposal', [...$this->claimData($claim), 'serializable' => true]);
+        $this->assertBlocked($change, $confirmation);
+        $this->release($change);
+        $this->assertSame(['kind' => 'changed'], $this->finish($change));
+        $this->assertSame(['technical_error' => '40001'], $this->finish($confirmation));
+        $this->assertSame(AppointmentProposalState::Pending, $proposal->fresh()->state);
+        $this->assertNull($proposal->fresh()->result);
+        $this->assertDatabaseCount('appointment_audits', 0);
+        $retry = $this->start('confirm_proposal', $this->claimData($claim));
+        $this->assertSame('not_eligible', $this->finish($retry)['outcome']);
+        $this->assertSame(AppointmentProposalState::Rejected, $proposal->fresh()->state);
+        $this->assertDatabaseCount('appointment_audits', 0);
+    }
+
+    /** @return array{AiTurnClaim, AppointmentProposal, Appointment} */
+    private function confirmation(string $sender = 'sender'): array
+    {
+        $customer = Customer::factory()->create();
+        ChannelIdentity::factory()->for($customer)->create(['external_id' => $sender]);
+        $service = Service::factory()->for($this->business)->create();
+        $professional = Professional::factory()->for($this->business)->create();
+        $appointment = Appointment::factory()->for($customer)->for($service)->for($professional)->create([
+            'starts_at' => '2030-02-01 10:00 UTC', 'ends_at' => '2030-02-01 11:00 UTC', 'status' => 'confirmed',
+        ]);
+        $coordinator = app(AiTurnCoordinator::class);
+        $coordinator->inbound($this->business, 'whatsapp', $sender, '1', 'Cancelar mi cita');
+        $claim = $coordinator->claimNext($this->business, 'whatsapp', $sender);
+        $result = app(PrepareAppointmentProposal::class)->handle($this->business, $claim, AppointmentProposalOperation::Cancel, ['appointment_id' => $appointment->id]);
+        $this->assertSame('prepared', $result['status']);
+        $coordinator->complete($this->business, $claim, '¿Confirmas la cancelación?');
+        $coordinator->inbound($this->business, 'whatsapp', $sender, '2', 'Sí');
+
+        return [
+            $coordinator->claimNext($this->business, 'whatsapp', $sender),
+            AppointmentProposal::findOrFail($result['proposal_id']), $appointment,
+        ];
+    }
+
     /** @return array{turn: int, token: string, inbound: int} */
     private function claimData(AiTurnClaim $claim): array
     {
@@ -541,13 +716,26 @@ class AiTurnConcurrencyTest extends TestCase
                  App\Models\AppointmentProposal::created(fn () => $wait('locked'));
              }
              if ($barrier === 'promotion') {
-                 App\Models\AppointmentProposal::updated(fn () => $wait('locked'));
-             }
+                  App\Models\AppointmentProposal::updated(fn () => $wait('locked'));
+              }
+            if ($barrier === 'execution') {
+                App\Models\AppointmentAudit::created(fn () => $wait('locked'));
+            }
             try {
                 $data = json_decode($argv[3], true, flags: JSON_THROW_ON_ERROR);
                 $business = App\Models\Business::findOrFail($data['business'] ?? $argv[1]);
                 $sender = $data['sender'] ?? 'sender';
                 $coordinator = app(App\Application\Conversation\AiTurnCoordinator::class);
+                if ($data['serializable'] ?? false) {
+                    Illuminate\Support\Facades\DB::statement('SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+                }
+                if ($barrier === 'deadlock') {
+                    App\Models\AppointmentAudit::creating(function () use ($data, $wait): void {
+                        Illuminate\Support\Facades\DB::select('select pg_advisory_xact_lock(?)', [$data['locks'][0]]);
+                        $wait('locked');
+                        Illuminate\Support\Facades\DB::select('select pg_advisory_xact_lock(?)', [$data['locks'][1]]);
+                    });
+                }
                 if ($argv[2] === 'sdk_process') {
                     config(['ai.default' => 'openai', 'ai.providers.openai.models.text.default' => 'test-model']);
                     $app->bind(Laravel\Ai\Contracts\ConversationStore::class, fn () => throw new RuntimeException('Unexpected SDK storage'));
@@ -558,6 +746,18 @@ class AiTurnConcurrencyTest extends TestCase
                     })->preventStrayPrompts();
                 }
                 $result = match ($argv[2]) {
+                    'confirm_proposal' => app(App\Application\Conversation\ConfirmAppointmentProposal::class)->handle(
+                        $business, new App\Application\Conversation\AiTurnClaim(
+                            $data['turn'], $data['token'], App\Models\ConversationMessage::findOrFail($data['inbound'])
+                        ), true,
+                    ),
+                    'change_appointment' => $coordinator->withOwnership($business, new App\Application\Conversation\AiTurnClaim(
+                        $data['turn'], $data['token'], App\Models\ConversationMessage::findOrFail($data['inbound'])
+                    ), function () use ($data, $wait): array {
+                        App\Models\Appointment::findOrFail($data['appointment'])->update(['status' => 'cancelled']);
+                        $wait('locked');
+                        return ['kind' => 'changed'];
+                    }),
                     'prepare_proposal' => app(App\Application\Conversation\AppointmentProposals::class)->prepare(
                         $business, new App\Application\Conversation\AiTurnClaim(
                             $data['turn'], $data['token'], App\Models\ConversationMessage::findOrFail($data['inbound'])
@@ -581,6 +781,7 @@ class AiTurnConcurrencyTest extends TestCase
                         }
                     })(),
                     'inbound' => $coordinator->inbound($business, 'web', $sender, $data['message'], 'hello'),
+                    'inbound_customer' => $coordinator->inbound($business, 'whatsapp', $sender, $data['message'], 'hello'),
                     'claim' => $coordinator->claimNext($business, 'web', $sender),
                     'claim_customer' => $coordinator->claimNext($business, 'whatsapp', $sender),
                     'register_customer' => (new App\Application\Conversation\RegisterCustomerTool(
@@ -628,6 +829,15 @@ class AiTurnConcurrencyTest extends TestCase
                     $result instanceof App\Models\ConversationMessage => ['kind' => 'message', 'id' => $result->id],
                 };
                 fwrite(STDOUT, json_encode($output, JSON_THROW_ON_ERROR)."\n");
+            } catch (Illuminate\Database\DeadlockException $exception) {
+                if (Illuminate\Support\Facades\DB::transactionLevel() !== 0) { throw new RuntimeException('Concurrency rollback left an open transaction'); }
+                fwrite(STDOUT, json_encode(['technical_error' => $exception->getPrevious()->errorInfo[0]], JSON_THROW_ON_ERROR)."\n");
+            } catch (Illuminate\Database\QueryException $exception) {
+                if (($exception->errorInfo[0] ?? null) !== '40001' || Illuminate\Support\Facades\DB::transactionLevel() !== 0) {
+                    fwrite(STDERR, get_class($exception).': '.$exception->getMessage());
+                    exit(1);
+                }
+                fwrite(STDOUT, json_encode(['technical_error' => $exception->errorInfo[0]], JSON_THROW_ON_ERROR)."\n");
             } catch (Throwable $exception) {
                 fwrite(STDERR, get_class($exception).': '.$exception->getMessage());
                 exit(1);

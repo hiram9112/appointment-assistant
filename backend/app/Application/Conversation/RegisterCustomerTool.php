@@ -6,6 +6,7 @@ use App\Application\Customer\RegisterCustomer;
 use App\Application\Customer\RegistrationOutcome;
 use App\Application\Customer\ResolveCustomer;
 use App\Models\AiTurn;
+use App\Models\AppointmentProposal;
 use App\Models\Business;
 use App\Models\Conversation;
 use App\Models\Customer;
@@ -40,6 +41,10 @@ final class RegisterCustomerTool implements Tool
         try {
             $result = $this->turns->withOwnership($this->business, $this->claim, function (AiTurn $turn, Conversation $conversation) use ($request): array {
                 $customer = $this->resolve->handle($conversation->channel, $conversation->sender_identity);
+                if (($customer === null || $conversation->customer_id !== $customer->id)
+                    && AppointmentProposal::query()->where('conversation_id', $conversation->id)->exists()) {
+                    return ['status' => 'identification_failed'];
+                }
                 $status = 'already_registered';
                 if ($customer === null) {
                     $registered = $this->register->handle(

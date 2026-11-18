@@ -16,6 +16,7 @@ final class ConversationTurnProcessor
         private BusinessContextBuilder $context,
         private ConversationHistoryAdapter $history,
         private AppointmentProposals $proposals,
+        private ConfirmAppointmentProposal $confirmations,
     ) {}
 
     /** Process or resume one participant's next turn; identities come from trusted application code. */
@@ -23,12 +24,19 @@ final class ConversationTurnProcessor
     {
         return $this->turns->processNext($business, $channel, $senderIdentity, function (AiTurnClaim $claim) use ($business): string {
             $proposal = $this->proposals->recover($business, $claim);
+            $result = $this->confirmations->recover($business, $claim);
+            if ($result instanceof AiTurnOutcome) {
+                throw new LogicException('The confirming turn is no longer authorized.');
+            }
             $business = Business::query()->findOrFail($business->id);
             $operationTime = DateTimeImmutable::createFromInterface(now());
             $context = $this->context->handle($business);
             $context['operation_time'] = $operationTime->setTimezone(new DateTimeZone($context['business']['timezone']))->format(DATE_ATOM);
             if ($proposal instanceof AppointmentProposal && $proposal->state === AppointmentProposalState::Prepared) {
                 $context['prepared_proposal'] = $proposal->structuredDetails();
+            }
+            if ($result !== null) {
+                $context['appointment_operation_result'] = $result;
             }
 
             $completed = $this->turns->completedBefore($business, $claim->inboundMessage->id);
