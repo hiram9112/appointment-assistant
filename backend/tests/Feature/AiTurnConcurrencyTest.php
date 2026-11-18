@@ -5,11 +5,20 @@ namespace Tests\Feature;
 use App\Application\Conversation\AiTurnClaim;
 use App\Application\Conversation\AiTurnCoordinator;
 use App\Application\Conversation\AiTurnState;
+use App\Application\Conversation\AppointmentProposalOperation;
+use App\Application\Conversation\AppointmentProposalPayload;
+use App\Application\Conversation\AppointmentProposalPresentation;
+use App\Application\Conversation\AppointmentProposals;
+use App\Application\Conversation\AppointmentProposalState;
 use App\Models\AiTurn;
+use App\Models\AppointmentProposal;
 use App\Models\Business;
 use App\Models\ChannelIdentity;
 use App\Models\Conversation;
 use App\Models\ConversationMessage;
+use App\Models\Professional;
+use App\Models\Service;
+use Carbon\CarbonImmutable;
 use Illuminate\Foundation\Testing\DatabaseMigrations;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -352,6 +361,96 @@ class AiTurnConcurrencyTest extends TestCase
         return ['coordinator' => ['process'], 'SDK agent' => ['sdk_process']];
     }
 
+    #[DataProvider('proposalRetries')]
+    public function test_concurrent_proposal_preparation_is_idempotent_and_cannot_change_the_same_turn_payload(bool $different): void
+    {
+        $coordinator = app(AiTurnCoordinator::class);
+        $coordinator->inbound($this->business, 'web', 'sender', '1', 'Book');
+        $claim = $coordinator->claimNext($this->business, 'web', 'sender');
+        $data = [...$this->claimData($claim), ...$this->proposalData()];
+        $first = $this->start('prepare_proposal', $data, 'proposal');
+        $this->assertSame("locked\n", $this->line($first));
+        $this->assertDatabaseCount('appointment_proposals', 0);
+        $retry = $data;
+        if ($different) {
+            $retry['payload']['starts_at'] = '2030-02-01T11:00:00+00:00';
+            $retry['presentation']['starts_at'] = '2030-02-01T11:00:00+00:00';
+            $retry['presentation']['ends_at'] = '2030-02-01T12:00:00+00:00';
+        }
+        $second = $this->start('prepare_proposal', $retry);
+        $this->assertBlocked($first, $second);
+        $this->release($first);
+        $result = $this->finish($first);
+        $this->assertSame('proposal', $result['kind']);
+        $this->assertSame($different ? ['kind' => 'proposal_outcome', 'name' => 'ParametersConflict'] : $result, $this->finish($second));
+        $this->assertDatabaseCount('appointment_proposals', 1);
+        $this->assertSame($data['payload'], AppointmentProposal::sole()->canonicalPayload()->toArray());
+    }
+
+    public static function proposalRetries(): array
+    {
+        return ['same parameters' => [false], 'different parameters' => [true]];
+    }
+
+    public function test_replacement_blocks_authorized_lookup_until_only_the_new_proposal_is_active(): void
+    {
+        $coordinator = app(AiTurnCoordinator::class);
+        $coordinator->inbound($this->business, 'web', 'sender', '1', 'Book');
+        $claim = $coordinator->claimNext($this->business, 'web', 'sender');
+        $data = $this->proposalData();
+        $proposals = app(AppointmentProposals::class);
+        $old = $proposals->prepare($this->business, $claim,
+            AppointmentProposalPayload::fromArray(AppointmentProposalOperation::Create, $data['payload']),
+            AppointmentProposalPresentation::fromArray($data['presentation']));
+        $prompt = $coordinator->complete($this->business, $claim, 'Confirm?');
+        $old->update(['state' => 'pending', 'confirmation_request_message_id' => $prompt->id]);
+        $coordinator->inbound($this->business, 'web', 'sender', '2', 'Change the Appointment');
+        $claim = $coordinator->claimNext($this->business, 'web', 'sender');
+        $data = [...$data, ...$this->claimData($claim)];
+        $replacement = $this->start('prepare_proposal', $data, 'proposal');
+        $this->assertSame("locked\n", $this->line($replacement));
+        $this->assertSame(AppointmentProposalState::Pending, $old->fresh()->state);
+        $lookup = $this->start('active_proposal', $data);
+        $this->assertBlocked($replacement, $lookup);
+        $this->release($replacement);
+        $new = $this->finish($replacement);
+        $this->assertSame($new, $this->finish($lookup));
+        $this->assertNotSame($old->id, $new['id']);
+        $this->assertSame(AppointmentProposalState::Rejected, $old->fresh()->state);
+        $this->assertDatabaseCount('appointment_proposals', 2);
+        $this->assertSame(1, AppointmentProposal::query()->whereIn('state', ['prepared', 'pending'])->count());
+    }
+
+    #[DataProvider('proposalRetries')]
+    public function test_postgresql_uniqueness_fences_concurrent_inserts_without_application_locking(bool $differentTurn): void
+    {
+        $coordinator = app(AiTurnCoordinator::class);
+        $firstTurn = $coordinator->inbound($this->business, 'web', 'sender', '1', 'Book');
+        $secondTurn = $coordinator->inbound($this->business, 'web', 'sender', '2', 'Another choice');
+        $data = [...$this->proposalData(), 'conversation' => $firstTurn->inboundMessage->conversation_id, 'turn' => $firstTurn->id];
+        $first = $this->start('insert_proposal', $data, 'proposal');
+        $this->assertSame("locked\n", $this->line($first));
+        $second = $this->start('insert_proposal', [...$data, 'turn' => $differentTurn ? $secondTurn->id : $firstTurn->id]);
+        $this->assertBlocked($first, $second);
+        $this->release($first);
+        $this->assertSame('proposal', $this->finish($first)['kind']);
+        $this->assertSame(['kind' => 'sqlstate', 'code' => '23505'], $this->finish($second));
+        $this->assertDatabaseCount('appointment_proposals', 1);
+    }
+
+    /** @return array{payload: array, presentation: array} */
+    private function proposalData(): array
+    {
+        $service = Service::factory()->for($this->business)->create();
+        $professional = Professional::factory()->for($this->business)->create(['display_name' => 'Dra. Laura']);
+        $start = CarbonImmutable::parse('2030-02-01 10:00:00 UTC');
+
+        return [
+            'payload' => AppointmentProposalPayload::create($service->id, $professional->id, $start)->toArray(),
+            'presentation' => (new AppointmentProposalPresentation($service->name, $professional->display_name, $start, $start->addHour(), $this->business->timezone))->toArray(),
+        ];
+    }
+
     /** @return array{turn: int, token: string, inbound: int} */
     private function claimData(AiTurnClaim $claim): array
     {
@@ -381,6 +480,9 @@ class AiTurnConcurrencyTest extends TestCase
             if ($barrier === 'registration') {
                 App\Models\Conversation::updating(fn () => $wait('locked'));
             }
+            if ($barrier === 'proposal') {
+                App\Models\AppointmentProposal::created(fn () => $wait('locked'));
+            }
             try {
                 $data = json_decode($argv[3], true, flags: JSON_THROW_ON_ERROR);
                 $business = App\Models\Business::findOrFail($data['business'] ?? $argv[1]);
@@ -396,6 +498,28 @@ class AiTurnConcurrencyTest extends TestCase
                     })->preventStrayPrompts();
                 }
                 $result = match ($argv[2]) {
+                    'prepare_proposal' => app(App\Application\Conversation\AppointmentProposals::class)->prepare(
+                        $business, new App\Application\Conversation\AiTurnClaim(
+                            $data['turn'], $data['token'], App\Models\ConversationMessage::findOrFail($data['inbound'])
+                        ), App\Application\Conversation\AppointmentProposalPayload::fromArray(
+                            App\Application\Conversation\AppointmentProposalOperation::Create, $data['payload']
+                        ), App\Application\Conversation\AppointmentProposalPresentation::fromArray($data['presentation']),
+                    ),
+                    'active_proposal' => app(App\Application\Conversation\AppointmentProposals::class)->active(
+                        $business, new App\Application\Conversation\AiTurnClaim(
+                            $data['turn'], $data['token'], App\Models\ConversationMessage::findOrFail($data['inbound'])
+                        ),
+                    ),
+                    'insert_proposal' => (function () use ($data) {
+                        try {
+                            return Illuminate\Support\Facades\DB::transaction(fn () => App\Models\AppointmentProposal::query()->create([
+                                'conversation_id' => $data['conversation'], 'originating_turn_id' => $data['turn'],
+                                'operation' => 'create', 'payload' => $data['payload'], 'presentation' => $data['presentation'],
+                            ]));
+                        } catch (Illuminate\Database\QueryException $exception) {
+                            return ['kind' => 'sqlstate', 'code' => $exception->errorInfo[0]];
+                        }
+                    })(),
                     'inbound' => $coordinator->inbound($business, 'web', $sender, $data['message'], 'hello'),
                     'claim' => $coordinator->claimNext($business, 'web', $sender),
                     'claim_customer' => $coordinator->claimNext($business, 'whatsapp', $sender),
@@ -437,6 +561,8 @@ class AiTurnConcurrencyTest extends TestCase
                     is_array($result) => $result,
                     is_string($result) => json_decode($result, true, flags: JSON_THROW_ON_ERROR),
                     $result instanceof App\Application\Conversation\AiTurnOutcome => ['kind' => 'outcome', 'name' => $result->name],
+                    $result instanceof App\Application\Conversation\AppointmentProposalOutcome => ['kind' => 'proposal_outcome', 'name' => $result->name],
+                    $result instanceof App\Models\AppointmentProposal => ['kind' => 'proposal', 'id' => $result->id],
                     $result instanceof App\Application\Conversation\AiTurnClaim => ['kind' => 'claim', 'id' => $result->turnId, 'token' => $result->token],
                     $result instanceof App\Models\AiTurn => ['kind' => 'turn', 'id' => $result->id],
                     $result instanceof App\Models\ConversationMessage => ['kind' => 'message', 'id' => $result->id],
