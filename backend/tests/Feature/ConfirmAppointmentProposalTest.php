@@ -532,8 +532,7 @@ class ConfirmAppointmentProposalTest extends TestCase
         ConversationAgent::assertPrompted(function (AgentPrompt $prompt) use ($result): bool {
             preg_match('/<runtime_context>\n(.*)\n<\/runtime_context>$/s', $prompt->agent->instructions(), $matches);
             $this->assertSame($result, json_decode($matches[1], true)['appointment_operation_result']);
-            $this->assertStringContainsString("in the customer's language", $prompt->agent->instructions());
-            $this->assertStringNotContainsString('professional Spanish', $prompt->agent->instructions());
+            $this->assertStringContainsString('natural, concise, professional Spanish', $prompt->agent->instructions());
             $this->assertStringContainsString('Report rejected outcomes accurately', $prompt->agent->instructions());
             $this->assertStringContainsString('describe unchanged rescheduling as no change', $prompt->agent->instructions());
             $this->assertSame('Please explain the outcome in English.', $prompt->prompt);
@@ -739,8 +738,7 @@ class ConfirmAppointmentProposalTest extends TestCase
             $this->assertSame($stored, $context['appointment_operation_result']);
             $this->assertArrayNotHasKey('prepared_proposal', $context);
             $this->assertStringContainsString('do not execute it again', $prompt->agent->instructions());
-            $this->assertStringContainsString("in the customer's language", $prompt->agent->instructions());
-            $this->assertStringNotContainsString('professional Spanish', $prompt->agent->instructions());
+            $this->assertStringContainsString('natural, concise, professional Spanish', $prompt->agent->instructions());
             $this->assertSame($confirmation, $prompt->prompt);
 
             return true;

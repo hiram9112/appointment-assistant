@@ -5,8 +5,14 @@ namespace Tests\Feature;
 use App\Application\Conversation\AiTurnCoordinator;
 use App\Application\Conversation\AiTurnState;
 use App\Application\Conversation\CheckAvailabilityTool;
+use App\Application\Conversation\ConfirmAppointmentProposalTool;
 use App\Application\Conversation\ConversationAgent;
 use App\Application\Conversation\ConversationTurnProcessor;
+use App\Application\Conversation\GetCustomerAppointmentsTool;
+use App\Application\Conversation\PrepareCancelAppointmentTool;
+use App\Application\Conversation\PrepareCreateAppointmentTool;
+use App\Application\Conversation\PrepareRescheduleAppointmentTool;
+use App\Application\Conversation\RegisterCustomerTool;
 use App\Models\Appointment;
 use App\Models\Business;
 use App\Models\BusinessOperatingHour;
@@ -273,7 +279,11 @@ class ConversationReadAcceptanceTest extends TestCase
         $execution = $this->executions[array_key_last($this->executions)];
         $this->assertSame($question, $execution->prompt->prompt);
         $this->assertSame($history, array_map(fn (Message $message): array => [$message->role->value, $message->content], $execution->prompt->messages));
-        $this->assertSame([CheckAvailabilityTool::class], array_map(fn ($tool): string => $tool::class, [...$execution->prompt->agent->tools()]));
+        $this->assertSame([
+            CheckAvailabilityTool::class, RegisterCustomerTool::class, GetCustomerAppointmentsTool::class,
+            PrepareCreateAppointmentTool::class, PrepareRescheduleAppointmentTool::class,
+            PrepareCancelAppointmentTool::class, ConfirmAppointmentProposalTool::class,
+        ], array_map(fn ($tool): string => $tool::class, [...$execution->prompt->agent->tools()]));
         $this->assertDatabaseHas('conversation_messages', ['id' => $response->id, 'role' => 'assistant', 'content' => $answer]);
 
         return $execution;

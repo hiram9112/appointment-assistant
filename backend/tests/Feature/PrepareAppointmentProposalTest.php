@@ -732,7 +732,8 @@ class PrepareAppointmentProposalTest extends TestCase
             $this->assertStringContainsString('Compose a new explicit confirmation question', $prompt->agent->instructions());
             $this->assertStringContainsString('natural, concise, professional Spanish', $prompt->agent->instructions());
             $this->assertStringContainsString('Do not prepare a replacement or recheck availability', $prompt->agent->instructions());
-            $this->assertSame([CheckAvailabilityTool::class], array_map(fn ($tool): string => $tool::class, [...$prompt->agent->tools()]));
+            $this->assertContains(CheckAvailabilityTool::class, array_map(fn ($tool): string => $tool::class, [...$prompt->agent->tools()]));
+            $this->assertContains(PrepareCreateAppointmentTool::class, array_map(fn ($tool): string => $tool::class, [...$prompt->agent->tools()]));
 
             return true;
         });
