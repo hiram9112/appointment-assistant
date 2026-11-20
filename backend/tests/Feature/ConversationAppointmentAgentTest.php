@@ -10,6 +10,7 @@ use App\Application\Conversation\ConversationAgent;
 use App\Application\Conversation\ConversationTurnProcessor;
 use App\Models\AiTurn;
 use App\Models\Appointment;
+use App\Models\AppointmentAudit;
 use App\Models\AppointmentProposal;
 use App\Models\Business;
 use App\Models\BusinessOperatingHour;
@@ -326,6 +327,25 @@ class ConversationAppointmentAgentTest extends TestCase
         return ['occupied' => ['conflict', 'slot_unavailable'], 'ineligible' => ['ineligible', 'invalid_request'], 'no change' => ['noop', 'unchanged']];
     }
 
+    public function test_explicit_request_to_keep_an_appointment_can_be_acknowledged_with_only_a_scoped_read(): void
+    {
+        $customer = $this->identify();
+        $appointment = $this->appointment($customer);
+        $before = $appointment->fresh()->getAttributes();
+        $this->inbound('Mantén mi cita con Laura el 1 de febrero a las once, sin cambiar ningún dato.');
+        $answer = 'Tu consulta con Laura el 1 de febrero a las once sigue confirmada sin cambios.';
+        ConversationAgent::fake([$this->toolCall('GetCustomerAppointmentsTool'), $answer])->preventStrayPrompts();
+
+        $this->assertSame($answer, $this->process()->fresh()->content);
+        $listing = $this->toolResult('GetCustomerAppointmentsTool');
+        $this->assertSame('ok', $listing['status']);
+        $this->assertSame([$appointment->id], array_column($listing['appointments'], 'id'));
+        $this->assertSame('confirmed', $listing['appointments'][0]['status']);
+        $this->assertSame($before, $appointment->fresh()->getAttributes());
+        $this->assertDatabaseCount('appointment_proposals', 0);
+        $this->assertDatabaseCount('appointment_audits', 0);
+    }
+
     #[DataProvider('interruptions')]
     public function test_sdk_tool_writes_recover_before_generation_without_repeating_them(string $phase, string $failure): void
     {
@@ -393,6 +413,46 @@ class ConversationAppointmentAgentTest extends TestCase
         $this->assertSame($result, $proposal->fresh()->result);
         $this->assertDatabaseCount('appointment_proposals', 1);
         $this->assertDatabaseCount('appointment_audits', $phase === 'prepared' ? 0 : 1);
+        if ($phase === 'completed') {
+            $proposalBefore = $proposal->fresh()->getAttributes();
+            $appointmentBefore = Appointment::sole()->getAttributes();
+            $auditBefore = AppointmentAudit::sole()->getAttributes();
+            $this->inbound('Sí, otra vez.');
+            $answer = 'Tu consulta con Laura ya quedó reservada. ¿A qué te refieres con «otra vez»?';
+            ConversationAgent::fake([$answer])->preventStrayPrompts();
+            $this->assertSame($answer, $this->process()->fresh()->content);
+            ConversationAgent::assertPrompted(function (AgentPrompt $prompt) use ($generated): bool {
+                if ($prompt->prompt !== 'Sí, otra vez.') {
+                    return false;
+                }
+                $context = $this->context($prompt);
+                $this->assertNull($context['active_proposal']);
+                $this->assertArrayNotHasKey('prepared_proposal', $context);
+                $this->assertArrayNotHasKey('appointment_operation_result', $context);
+                $this->assertSame([
+                    ['user', 'Sí, confirmo.'], ['assistant', $generated],
+                ], array_map(fn (Message $message): array => [$message->role->value, $message->content], array_slice($prompt->messages, -2)));
+                $this->assertNotContains('Unaccepted model response', array_map(fn (Message $message): string => $message->content, $prompt->messages));
+                $this->assertStringContainsString('Preserve success communicated in completed history, including recovered success', $prompt->agent->instructions());
+                $this->assertStringContainsString('"Sí, otra vez." needs acknowledgement and clarification, never repetition or reactivation', $prompt->agent->instructions());
+
+                return true;
+            });
+            $this->assertCount(0, $this->responses[array_key_last($this->responses)]->toolResults);
+
+            $this->inbound('Comprueba el estado actual de esa cita.');
+            ConversationAgent::fake([$this->toolCall('GetCustomerAppointmentsTool'), 'La cita sigue confirmada.'])->preventStrayPrompts();
+            $this->process();
+            $this->assertSame([$appointmentBefore['id']], array_column($this->toolResult('GetCustomerAppointmentsTool')['appointments'], 'id'));
+            $this->assertSame('confirmed', $this->toolResult('GetCustomerAppointmentsTool')['appointments'][0]['status']);
+            $this->assertSame($proposalBefore, $proposal->fresh()->getAttributes());
+            $this->assertSame($appointmentBefore, Appointment::sole()->getAttributes());
+            $this->assertSame($auditBefore, AppointmentAudit::sole()->getAttributes());
+            $this->assertSame(AppointmentProposalState::Completed, $proposal->fresh()->state);
+            $this->assertDatabaseCount('appointment_proposals', 1);
+            $this->assertDatabaseCount('appointments', 1);
+            $this->assertDatabaseCount('appointment_audits', 1);
+        }
     }
 
     public static function interruptions(): array
@@ -729,6 +789,7 @@ class ConversationAppointmentAgentTest extends TestCase
 
     public function test_instructions_cover_confirmation_branching_spanish_and_mixed_intent_without_backend_templates(): void
     {
+        $this->identify();
         $this->inbound('Información, por favor.');
         ConversationAgent::fake(['Respuesta informativa.'])->preventStrayPrompts();
         $this->process();
@@ -745,6 +806,17 @@ class ConversationAppointmentAgentTest extends TestCase
                 'Prepared and pending are not completed', 'unchanged rescheduling as no change',
                 'Technical errors are not rejection, success', 'one coherent response',
                 'customer-supplied IDs', 'Rescheduling candidates must use PrepareRescheduleAppointmentTool',
+                'execute the prepared booking, rescheduling, or cancellation, not prepare it again',
+                '¿Confirmas esta reserva?',
+                'after success, report completion',
+                'Only announce a new Appointment-changing success from an authoritative completed tool result',
+                'Preserve success communicated in completed history, including recovered success',
+                'no_pending_proposal does not undo it',
+                'History supports continuity, not execution or authorization',
+                'After success with no active proposal',
+                '"Sí, otra vez." needs acknowledgement and clarification, never repetition or reactivation',
+                'use scoped GetCustomerAppointmentsTool, not availability',
+                'New operations need fresh proposals and later confirmation',
             ] as $rule) {
                 $this->assertStringContainsString($rule, $instructions);
             }

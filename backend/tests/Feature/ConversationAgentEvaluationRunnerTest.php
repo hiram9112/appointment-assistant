@@ -62,7 +62,9 @@ class ConversationAgentEvaluationRunnerTest extends TestCase
 
         $report = (new ConversationAgentEvaluationRunner($business, $this->output))->run();
 
-        $this->assertSame('completed_needs_review', $report['status']);
+        $this->assertSame('completed_needs_review', $report['status'], json_encode([
+            'failure' => $report['failure'] ?? null, 'usage' => $report['usage'],
+        ], JSON_THROW_ON_ERROR));
         $this->assertSame('pending', $report['developer_review']);
         $this->assertCount(12, $report['scenarios']);
         $this->assertSame(array_fill(0, 12, 'pass'), array_column($report['scenarios'], 'contract_status'));
@@ -111,7 +113,9 @@ class ConversationAgentEvaluationRunnerTest extends TestCase
         $report = (new ConversationAgentEvaluationRunner($business, $this->output))->run($scenarios);
 
         $this->assertCount(13, $report['scenarios']);
-        $this->assertSame($truncate ? 'fail' : 'pass', $report['scenarios'][13]['contract_status']);
+        $this->assertSame($truncate ? 'fail' : 'pass', $report['scenarios'][13]['contract_status'], json_encode([
+            'failure' => $report['failure'] ?? null, 'usage' => $report['usage'],
+        ], JSON_THROW_ON_ERROR));
         $this->assertSame($truncate ? 'contract_failures' : 'completed_needs_review', $report['status']);
         $this->assertSame('Additional question?', $report['scenarios'][13]['turns'][0]['prompt']);
         Http::assertSentCount($number);

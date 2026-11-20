@@ -398,6 +398,8 @@ class ConfirmAppointmentProposalTest extends TestCase
         $this->assertSame(['decision'], $schema['required']);
         $this->assertSame(['confirm', 'decline'], $schema['properties']['decision']['enum']);
         $this->assertStringContainsString('conditional, ambiguous, or changed preferences', $tool->description());
+        $this->assertStringContainsString('no_pending_proposal does not negate earlier success', $tool->description());
+        $this->assertStringContainsString('verify current state via GetCustomerAppointmentsTool', $tool->description());
     }
 
     public function test_stale_mismatched_completed_and_wrong_business_claims_cannot_execute(): void
@@ -451,9 +453,10 @@ class ConfirmAppointmentProposalTest extends TestCase
     }
 
     #[DataProvider('scopeChanges')]
-    public function test_current_identity_and_business_scope_are_revalidated(string $operation, string $scope): void
+    public function test_current_identity_and_business_scope_are_revalidated(string $operation, string $scope, bool $sameTime = false): void
     {
-        $proposal = $this->pending($operation);
+        $arguments = $sameTime ? ['appointment_id' => $this->appointment('2030-02-01 10:00:17 UTC')->id] : [];
+        $proposal = $this->pending($operation, $arguments);
         if ($scope === 'service') {
             $this->service->business()->associate(Business::factory()->create())->save();
         } elseif ($scope === 'professional') {
@@ -478,6 +481,9 @@ class ConfirmAppointmentProposalTest extends TestCase
             'reschedule other Customer' => ['reschedule', 'customer'],
             'reschedule foreign service' => ['reschedule', 'service'],
             'reschedule foreign Professional' => ['reschedule', 'professional'],
+            'no-op reschedule other Customer' => ['reschedule', 'customer', true],
+            'no-op reschedule foreign service' => ['reschedule', 'service', true],
+            'no-op reschedule foreign Professional' => ['reschedule', 'professional', true],
             'cancel other Customer' => ['cancel', 'customer'],
             'cancel foreign service' => ['cancel', 'service'],
             'cancel foreign Professional' => ['cancel', 'professional'],
@@ -586,13 +592,55 @@ class ConfirmAppointmentProposalTest extends TestCase
     {
         $appointment = $this->appointment('2030-02-01 10:00:17 UTC');
         $before = $appointment->fresh()->getAttributes();
-        $this->pending('reschedule', ['appointment_id' => $appointment->id]);
-        $result = $this->invoke(['decision' => 'confirm']);
+        $originatingClaim = $this->claim;
+        $proposal = $this->prepare('reschedule', ['appointment_id' => $appointment->id]);
+        $this->assertSame('pgsql', DB::connection()->getDriverName());
+        $this->assertSame(AppointmentProposalState::Prepared, $proposal->state);
+        $this->assertSame($appointment->id, $proposal->payload['appointment_id']);
+        $this->assertSame('2030-02-01T10:00:17+00:00', $proposal->payload['starts_at']);
+        $this->assertSame($this->professional->id, $proposal->payload['professional_id']);
+        $this->assertSame($before, $appointment->fresh()->getAttributes());
+        $this->assertSame('confirmation_required', $this->invoke(['decision' => 'confirm'])['status']);
+        $this->turns->inbound($this->business, 'whatsapp', 'sender', 'early-noop', 'Sí, antes de la pregunta.');
+        $question = $this->turns->complete($this->business, $this->claim, '¿Confirmas esta propuesta con los mismos datos?');
+        $this->assertSame(AppointmentProposalState::Pending, $proposal->fresh()->state);
+        $this->assertSame($question->id, $proposal->fresh()->confirmation_request_message_id);
+        $this->claim = $this->turns->claimNext($this->business, 'whatsapp', 'sender');
+        $this->assertSame('confirmation_required', $this->invoke(['decision' => 'confirm'])['status']);
+        $this->assertNull($proposal->fresh()->result);
+        $this->assertSame($before, $appointment->fresh()->getAttributes());
+        $this->assertDatabaseCount('appointment_audits', 0);
+        $this->nextTurn('Sí, confirmo la propuesta presentada.');
+        $confirmingTurn = $this->claim->turnId;
+        $this->assertGreaterThan($question->id, $this->claim->inboundMessage->id);
+        $confirm = app(ConfirmAppointmentProposal::class);
+        $this->assertSame('not_authorized', $confirm->handle($this->business, $originatingClaim, true)['status']);
+        $this->assertSame('not_authorized', $confirm->handle(Business::factory()->create(), $this->claim, true)['status']);
+        $this->assertNull($proposal->fresh()->result);
+
+        Appointment::saving(fn () => throw new RuntimeException('A no-op must not save the Appointment'));
+        AppointmentAudit::creating(fn () => throw new RuntimeException('A no-op must not produce an audit'));
+        try {
+            $result = $this->invoke(['decision' => 'confirm']);
+            $this->assertSame($result, $this->invoke(['decision' => 'confirm']));
+            $this->assertSame($result, app(ConfirmAppointmentProposal::class)->recover($this->business, $this->claim));
+            $this->nextTurn('Sí, otra vez.');
+            $this->assertSame(['status' => 'no_pending_proposal'], $this->invoke(['decision' => 'confirm']));
+        } finally {
+            Appointment::flushEventListeners();
+            AppointmentAudit::flushEventListeners();
+        }
         $this->assertSame('completed', $result['status']);
         $this->assertSame('unchanged', $result['outcome']);
         $this->assertFalse($result['changed']);
         $this->assertSame($result['previous'], $result['appointment']);
+        $this->assertSame('confirmed', $result['appointment']['status']);
+        $this->assertSame(AppointmentProposalState::Completed, $proposal->fresh()->state);
+        $this->assertSame($confirmingTurn, $proposal->fresh()->confirming_turn_id);
+        $this->assertSame($result, $proposal->fresh()->result);
         $this->assertSame($before, $appointment->fresh()->getAttributes());
+        $this->assertDatabaseCount('appointments', 1);
+        $this->assertDatabaseCount('appointment_proposals', 1);
         $this->assertDatabaseCount('appointment_audits', 0);
     }
 

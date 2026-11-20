@@ -17,13 +17,11 @@ use Carbon\CarbonImmutable;
 use Database\Seeders\BusinessSeeder;
 use DateTimeImmutable;
 use DateTimeZone;
-use GuzzleHttp\Psr7\Utils;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
-use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 use Laravel\Ai\Contracts\ConversationStore;
 use Laravel\Ai\Events\AgentPrompted;
@@ -33,8 +31,6 @@ use Laravel\Ai\Events\ToolFailed;
 use Laravel\Ai\Events\ToolInvoked;
 use Laravel\Ai\Messages\Message;
 use Laravel\Ai\Tools\Request;
-use Psr\Http\Message\RequestInterface;
-use Psr\Http\Message\ResponseInterface;
 use RuntimeException;
 use Throwable;
 
@@ -57,13 +53,7 @@ final class ConversationAgentEvaluationRunner
 
     private array $current = [];
 
-    private array $fingerprints = [];
-
-    private int $requests = 0;
-
-    private int $bytes = 0;
-
-    private int $tokens = 0;
+    private EvaluationProviderGuard $provider;
 
     private ?int $scenarioId = null;
 
@@ -80,10 +70,11 @@ final class ConversationAgentEvaluationRunner
     }
 
     /** Refuse remote, URL-overridden, non-PostgreSQL or non-local reset targets. */
-    public static function configureIsolatedDatabase(): void
+    public static function configureIsolatedDatabase(string $database = self::Database): void
     {
         $connection = config('database.connections.pgsql');
-        if (! app()->environment('local') || app()->configurationIsCached()
+        if (! in_array($database, [self::Database, AppointmentOperationsEvaluationRunner::Database], true)
+            || ! app()->environment('local') || app()->configurationIsCached()
             || ! is_array($connection) || ($connection['driver'] ?? null) !== 'pgsql'
             || isset($connection['read']) || isset($connection['write'])
             || ! in_array($connection['host'] ?? null, ['127.0.0.1', 'localhost', '::1'], true)) {
@@ -92,10 +83,10 @@ final class ConversationAgentEvaluationRunner
         config([
             'database.default' => 'conversation_agent_evaluation',
             'database.connections.conversation_agent_evaluation' => [
-                ...$connection, 'url' => null, 'database' => self::Database, 'search_path' => 'public',
+                ...$connection, 'url' => null, 'database' => $database, 'search_path' => 'public',
             ],
         ]);
-        if (DB::selectOne('select current_database() as name')->name !== self::Database) {
+        if (DB::selectOne('select current_database() as name')->name !== $database) {
             throw new RuntimeException('smoke_database_guard');
         }
     }
@@ -303,7 +294,7 @@ final class ConversationAgentEvaluationRunner
 
     private function executeTurn(int $id, int $index, array $turn): void
     {
-        $this->fingerprints = [];
+        $this->provider->beginAttempt();
         $this->current = [
             'index' => $index, 'prompt' => $turn['prompt'], 'expected_arguments' => $turn['arguments'],
             'expected_status' => $turn['status'] ?? null, 'contract_status' => 'running',
@@ -356,42 +347,8 @@ final class ConversationAgentEvaluationRunner
     {
         config(['ai.default' => 'openai', 'ai.providers.openai.store' => false, 'logging.default' => 'null']);
         app()->bind(ConversationStore::class, fn () => throw new RuntimeException('smoke_sdk_storage_used'));
-        Http::globalMiddleware(function (callable $handler): callable {
-            return function (RequestInterface $request, array $options) use ($handler) {
-                if ((string) $request->getUri() !== 'https://api.openai.com/v1/responses' || $request->getMethod() !== 'POST') {
-                    throw new RuntimeException('smoke_endpoint_guard');
-                }
-                $body = json_decode((string) $request->getBody(), true, flags: JSON_THROW_ON_ERROR);
-                $body['max_output_tokens'] = $body['model'] === 'gpt-6-luna'
-                    ? self::Limits['luna_output_tokens_per_request']
-                    : self::Limits['output_tokens_per_request'];
-                $body['store'] = false;
-                $json = json_encode($body, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE);
-                $fingerprint = hash('sha256', $json);
-                if (isset($this->fingerprints[$fingerprint])) {
-                    throw new RuntimeException('smoke_retry_blocked');
-                }
-                if ($this->requests >= self::Limits['http_requests']
-                    || count($this->fingerprints) >= self::Limits['requests_per_turn']
-                    || strlen($json) > self::Limits['request_bytes']
-                    || $this->bytes + strlen($json) > self::Limits['total_request_bytes']
-                    || $this->tokens >= self::Limits['reported_tokens']) {
-                    throw new RuntimeException('smoke_budget_exceeded');
-                }
-                $this->fingerprints[$fingerprint] = true;
-                $this->requests++;
-                $this->bytes += strlen($json);
-                $this->save();
-                $request = $request->withBody(Utils::streamFor($json))->withoutHeader('Content-Length');
-                $options['timeout'] = self::Limits['timeout_seconds'];
-                $options['connect_timeout'] = 10;
-                $options['allow_redirects'] = false;
-
-                // SDK 1.4 retries short Retry-After responses. Strip it only in this local process;
-                // the request fingerprint guard also fences identical retransmissions.
-                return $handler($request, $options)->then(fn (ResponseInterface $response): ResponseInterface => $response->withoutHeader('Retry-After'));
-            };
-        });
+        $this->provider = new EvaluationProviderGuard(self::Limits);
+        $this->provider->install(fn () => $this->save());
         Event::listen(PromptingAgent::class, function (PromptingAgent $event): void {
             if (! $event->prompt->agent instanceof ConversationAgent) {
                 throw new RuntimeException('smoke_unexpected_agent');
@@ -405,7 +362,7 @@ final class ConversationAgentEvaluationRunner
             $this->save();
         });
         Event::listen(StepCompleted::class, function (StepCompleted $event): void {
-            $this->tokens += $event->response->usage->inputTokens + $event->response->usage->outputTokens;
+            $this->provider->recordTokens($event->response->usage->inputTokens + $event->response->usage->outputTokens);
             $this->current['steps'][] = [
                 'model' => $event->response->meta->model, 'text' => $event->response->text,
                 'finish_reason' => $event->response->finishReason->value, 'usage' => $event->response->usage->toArray(),
@@ -459,7 +416,7 @@ final class ConversationAgentEvaluationRunner
         if ($this->current !== [] && $this->scenarioId !== null) {
             $this->report['scenarios'][$this->scenarioId]['turns'][$this->current['index']] = $this->current;
         }
-        $this->report['usage'] = ['http_requests' => $this->requests, 'request_bytes' => $this->bytes, 'reported_tokens' => $this->tokens];
+        $this->report['usage'] = $this->provider->usage();
         $json = json_encode($this->report, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $key = config('ai.providers.openai.key');
         if (is_string($key) && $key !== '') {

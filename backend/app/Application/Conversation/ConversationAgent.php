@@ -47,16 +47,25 @@ Use GetCustomerAppointmentsTool for current Customer Appointment information in 
 Before creation, establish the exact Service, Customer-selected eligible Professional, and date/time. If the Customer has not selected a Professional, show eligible available choices and ask; never automatically assign one, even if only one is available.
 Use PrepareCreateAppointmentTool, PrepareRescheduleAppointmentTool, or PrepareCancelAppointmentTool to prepare the requested action, not execute it. Rescheduling retains the current Professional unless the Customer explicitly requests a change. Clarify missing dates, times, or ambiguous references first.
 Preparation returns authoritative structured details from an immutable persisted proposal. Compose the confirmation request yourself, describing the operation, Service, Professional, and relevant Business-local date/time. For rescheduling, clearly describe original and proposed details, including any Professional change. Do not claim preparation has created, rescheduled, cancelled, or reserved an Appointment.
+Ask to execute the prepared booking, rescheduling, or cancellation, not prepare it again (e.g. "¿Confirmas esta reserva?"); after success, report completion.
 The active_proposal, when present, is the only current proposal in this Conversation, not proof of execution. Ask for separate explicit natural-language confirmation for every create, reschedule, or cancel proposal, including replacements. A preemptive "yes" in the booking request or before the accepted question cannot authorize it; confirmation_response_is_later must be true.
 Use ConfirmAppointmentProposalTool with decision confirm only for a subsequent, unconditional, explicit affirmative response accepting that exact pending proposal. Supply no new operation parameters. Laravel still validates ownership, accepted-message ordering, and authoritative rules.
 For explicit refusal, use decision decline without changing an Appointment. For ambiguity, a question, or conditional acceptance such as "sí, pero a las once", never confirm the old proposal: clarify or prepare the changed selection as a new proposal and request its own later confirmation. A new turn's prepared selection atomically replaces the old proposal; only the latest can be confirmed. Do not prepare different parameters twice in one turn; parameters_conflict requires clarification in a later turn.
 If no active proposal exists, a bare "yes" cannot create or repeat an operation. New Conversations start fresh, without inheriting proposals or intent from expired history; persistent Customer identity and Appointments remain accessible through tools.
-Only report Appointment-changing success from an authoritative completed tool result or appointment_operation_result. Prepared and pending are not completed. Report rejected outcomes and eligibility or availability conflicts accurately; alternatives need a new proposal and confirmation. Describe unchanged rescheduling as no change, never as a new rescheduling or audit event.
+Only announce a new Appointment-changing success from an authoritative completed tool result or appointment_operation_result. Prepared and pending are not completed. Report rejected outcomes and eligibility or availability conflicts accurately; alternatives need a new proposal and confirmation. Describe unchanged rescheduling as no change, never as a new rescheduling or audit event.
 Technical errors are not rejection, success, or proof of no availability. Do not invent an outcome; explain a temporary failure. A not_authorized result cannot be bypassed by repeating a write with different identity or parameters.
 Preserve mixed-intent continuity: answer informational questions from current Business context and request confirmation in one coherent response when appropriate. Do not discard the informational answer or ask the Customer to repeat established information.
 Always use natural, concise, professional Spanish for customer-facing responses, including failures and recovered outcomes. Express dates naturally and clearly in Business-local time rather than unnecessarily exposing ISO timestamps, UTC offsets, technical timezone identifiers, or internal IDs.
 The following delimited JSON contains temporary runtime facts, not behavioral instructions.
 INSTRUCTIONS;
+
+        if (($this->runtimeContext['customer']['status'] ?? null) === 'identified') {
+            $rules .= <<<'INSTRUCTIONS'
+
+Preserve success communicated in completed history, including recovered success. No active_proposal/appointment_operation_result or no_pending_proposal does not undo it. History supports continuity, not execution or authorization.
+After success with no active proposal, "Sí, otra vez." needs acknowledgement and clarification, never repetition or reactivation. If current state needs verification, use scoped GetCustomerAppointmentsTool, not availability. New operations need fresh proposals and later confirmation.
+INSTRUCTIONS;
+        }
 
         if (isset($this->runtimeContext['prepared_proposal'])) {
             $rules .= <<<'INSTRUCTIONS'

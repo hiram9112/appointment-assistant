@@ -22,7 +22,8 @@ final class ConfirmAppointmentProposalTool implements Tool
     {
         return 'Confirm or decline the current persisted proposal only after a subsequent explicit Customer response to the accepted confirmation question. '
             .'Use confirm only for unconditional affirmative acceptance; conditional, ambiguous, or changed preferences require clarification or a new proposal, never execution of the old one. '
-            .'Laravel supplies all identity and operation parameters. Report only the authoritative returned result, including rejection or unchanged rescheduling; never invent success.';
+            .'Laravel supplies all identity and operation parameters. Report only the authoritative returned result, including rejection or unchanged rescheduling; never invent success. '
+            .'no_pending_proposal does not negate earlier success; verify current state via GetCustomerAppointmentsTool.';
     }
 
     public function handle(Request $request): string
