@@ -31,6 +31,7 @@ use App\Models\Service;
 use DateTimeImmutable;
 use Illuminate\Foundation\Testing\DatabaseMigrations;
 use Illuminate\JsonSchema\JsonSchemaTypeFactory;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
 use Laravel\Ai\Contracts\Tool;
@@ -111,6 +112,7 @@ class PrepareAppointmentProposalTest extends TestCase
         $this->assertDatabaseCount('appointments', 0);
         ChannelIdentity::query()->where('external_id', 'sender')->update(['customer_id' => $this->customer->id]);
         $this->turns->fail($this->business, $this->claim);
+        Carbon::setTestNow(AiTurn::findOrFail($this->claim->turnId)->next_attempt_at);
         $this->claim = $this->turns->claimNext($this->business, 'whatsapp', 'sender');
         $this->preventAvailabilityRecalculation();
         $this->assertSame($prepared, $this->create());
@@ -402,6 +404,7 @@ class PrepareAppointmentProposalTest extends TestCase
         $this->assertSame(AiTurnState::Processing, AiTurn::findOrFail($this->claim->turnId)->state);
         $this->assertDatabaseCount('conversation_messages', 1);
         $this->turns->fail($this->business, $this->claim);
+        Carbon::setTestNow(AiTurn::findOrFail($this->claim->turnId)->next_attempt_at);
         $generated = '¿Confirmas la consulta con Laura para el viernes 1 de febrero a las once?';
         ConversationAgent::fake([$generated])->preventStrayPrompts();
         $message = app(ConversationTurnProcessor::class)->processNext($this->business, 'whatsapp', 'sender');
@@ -432,6 +435,7 @@ class PrepareAppointmentProposalTest extends TestCase
             'professional_id' => $this->professional('Claudia')->id,
         ];
         $this->turns->fail($this->business, $this->claim);
+        Carbon::setTestNow(AiTurn::findOrFail($this->claim->turnId)->next_attempt_at);
         $tool = null;
         try {
             $this->turns->processNext($this->business, 'whatsapp', 'sender', function (AiTurnClaim $claim) use (&$tool, $toolClass, $arguments): string {
@@ -465,6 +469,7 @@ class PrepareAppointmentProposalTest extends TestCase
 
             return $generated;
         })->preventStrayPrompts();
+        Carbon::setTestNow(AiTurn::findOrFail($this->claim->turnId)->next_attempt_at);
         $message = app(ConversationTurnProcessor::class)->processNext($this->business, 'whatsapp', 'sender');
         $this->assertSame($generated, $message->fresh()->content);
         $this->assertSame(AppointmentProposalState::Pending, $proposal->fresh()->state);
@@ -490,10 +495,13 @@ class PrepareAppointmentProposalTest extends TestCase
 
     public function test_failed_recovery_generation_and_unaccepted_wording_leave_the_original_proposal_recoverable(): void
     {
+        /** This regression exercises four authorized attempts, using a configured bounded budget. */
+        config(['conversation.processing.max_attempts' => 4]);
         $this->create();
         $proposal = AppointmentProposal::sole();
         $before = $proposal->getAttributes();
         $this->turns->fail($this->business, $this->claim);
+        Carbon::setTestNow(AiTurn::findOrFail($this->claim->turnId)->next_attempt_at);
         $this->preventAvailabilityRecalculation();
         ConversationAgent::fake(function (): string {
             $this->assertSame(0, DB::transactionLevel());
@@ -511,6 +519,7 @@ class PrepareAppointmentProposalTest extends TestCase
 
         ConversationAgent::fake(['¿Te gustaría confirmar esta consulta con Laura?'])->preventStrayPrompts();
         ConversationMessage::creating(fn () => throw new RuntimeException('Recovery insertion failed'));
+        Carbon::setTestNow(AiTurn::findOrFail($this->claim->turnId)->next_attempt_at);
         try {
             app(ConversationTurnProcessor::class)->processNext($this->business, 'whatsapp', 'sender');
             $this->fail('Unaccepted wording must not promote the proposal.');
@@ -525,6 +534,7 @@ class PrepareAppointmentProposalTest extends TestCase
         $this->assertDatabaseCount('conversation_messages', 1);
 
         $accepted = '¿Confirmas la reserva con Laura el viernes 1 de febrero a las once?';
+        Carbon::setTestNow(AiTurn::findOrFail($this->claim->turnId)->next_attempt_at);
         ConversationAgent::fake([$accepted])->preventStrayPrompts();
         $message = app(ConversationTurnProcessor::class)->processNext($this->business, 'whatsapp', 'sender');
         $this->assertSame($accepted, $message->fresh()->content);
@@ -586,6 +596,7 @@ class PrepareAppointmentProposalTest extends TestCase
         $this->assertSame(AppointmentProposalState::Prepared, $new->state);
         $this->assertNull($new->confirmation_request_message_id);
         $generated = '¿Confirmas la nueva propuesta con Laura para el viernes 1 de febrero a las dos de la tarde?';
+        Carbon::setTestNow(AiTurn::findOrFail($this->claim->turnId)->next_attempt_at);
         ConversationAgent::fake([$generated])->preventStrayPrompts();
         $message = app(ConversationTurnProcessor::class)->processNext($this->business, 'whatsapp', 'sender');
         $this->assertSame($generated, $message->fresh()->content);
@@ -603,6 +614,7 @@ class PrepareAppointmentProposalTest extends TestCase
         $this->service->update(['price_amount' => '45.00', 'currency_code' => 'EUR']);
         $this->claim->inboundMessage->update(['content' => '¿Cuánto cuesta la consulta? Quiero reservar con Laura el 1 de febrero a las once.']);
         $this->turns->fail($this->business, $this->claim);
+        Carbon::setTestNow(AiTurn::findOrFail($this->claim->turnId)->next_attempt_at);
         ConversationAgent::fake(function () use ($generated): string {
             $this->assertSame(0, DB::transactionLevel());
             $turn = AiTurn::sole();

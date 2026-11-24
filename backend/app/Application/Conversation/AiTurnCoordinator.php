@@ -7,12 +7,15 @@ use App\Models\AppointmentProposal;
 use App\Models\Business;
 use App\Models\Conversation;
 use App\Models\ConversationMessage;
+use Carbon\CarbonImmutable;
 use Closure;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Http\Client\RequestException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
+use Laravel\Ai\Exceptions\InsufficientCreditsException;
 use LogicException;
 use Throwable;
 
@@ -44,11 +47,22 @@ final class AiTurnCoordinator
      */
     public function claimNext(Business $business, string $channel, string $senderIdentity, int $leaseSeconds = 300): AiTurnClaim|AiTurnOutcome
     {
+        return $this->claim($business, $channel, $senderIdentity, $leaseSeconds, false);
+    }
+
+    /** Finalization can accept a response or terminate work, but cannot authorize AI tools. */
+    public function claimFinalizationNext(Business $business, string $channel, string $senderIdentity, int $leaseSeconds = 300): AiTurnClaim|AiTurnOutcome
+    {
+        return $this->claim($business, $channel, $senderIdentity, $leaseSeconds, true);
+    }
+
+    private function claim(Business $business, string $channel, string $senderIdentity, int $leaseSeconds, bool $finalization): AiTurnClaim|AiTurnOutcome
+    {
         if ($leaseSeconds < 1) {
             throw new InvalidArgumentException('The processing lease must be positive.');
         }
 
-        return DB::transaction(function () use ($business, $channel, $senderIdentity, $leaseSeconds): AiTurnClaim|AiTurnOutcome {
+        return DB::transaction(function () use ($business, $channel, $senderIdentity, $leaseSeconds, $finalization): AiTurnClaim|AiTurnOutcome {
             $this->lock->acquire($business->id, $channel, $senderIdentity);
             $conversations = $this->participant($business, $channel, $senderIdentity);
             $current = (clone $conversations)->orderByDesc('last_activity_at')->orderByDesc('id')->first();
@@ -64,21 +78,62 @@ final class AiTurnCoordinator
 
             $turns = AiTurn::query()->whereHas('inboundMessage', fn (Builder $query) => $query
                 ->whereIn('conversation_id', (clone $conversations)->select('id')))
-                ->whereIn('state', [AiTurnState::Pending, AiTurnState::Processing, AiTurnState::Failed]);
+                ->whereIn('state', [AiTurnState::Pending, AiTurnState::Processing, AiTurnState::Failed,
+                    AiTurnState::FailureResolutionPending, AiTurnState::ResolvingFailure]);
 
             (clone $turns)->whereHas('inboundMessage', fn (Builder $query) => $query->where('conversation_id', '!=', $current->id))
-                ->update(['state' => AiTurnState::Superseded, 'claim_token' => null, 'claimed_until' => null]);
+                ->update(['state' => AiTurnState::Superseded, 'claim_token' => null, 'claimed_until' => null, 'next_attempt_at' => null]);
 
             $turn = $turns->orderBy('inbound_message_id')->lockForUpdate()->first();
             if (! $turn) {
                 return AiTurnOutcome::Idle;
             }
-            if ($turn->state === AiTurnState::Processing && $turn->claimed_until->isFuture()) {
+            if (in_array($turn->state, [AiTurnState::Processing, AiTurnState::ResolvingFailure], true) && $turn->claimed_until->isFuture()) {
                 return AiTurnOutcome::Busy;
+            }
+            if ($turn->next_attempt_at?->isFuture()) {
+                return AiTurnOutcome::NotDue;
+            }
+
+            $exhausted = in_array($turn->state, [AiTurnState::FailureResolutionPending, AiTurnState::ResolvingFailure], true)
+                || $turn->attempt_count >= max(1, (int) config('conversation.processing.max_attempts'));
+            if ($turn->state === AiTurnState::Processing && ! $exhausted) {
+                $claimedAt = $turn->diagnostics['attempts'][$turn->attempt_count]['claimed_at'] ?? $turn->updated_at;
+                if (CarbonImmutable::parse($claimedAt)->addSeconds($this->retryDelay($turn->attempt_count))->isFuture()) {
+                    return AiTurnOutcome::NotDue;
+                }
+            }
+            if ($turn->state === AiTurnState::Processing) {
+                $this->recordFailure($turn, AiTurnFailure::Recoverable, AiTurnFailureReason::ClaimExpired);
+            }
+            if ($turn->state === AiTurnState::ResolvingFailure) {
+                $this->recordFinalizationFailure($turn, AiTurnFailure::Recoverable, AiTurnFailureReason::ClaimExpired);
+            }
+            if ($exhausted) {
+                $turn->fill(['state' => AiTurnState::FailureResolutionPending, 'claim_token' => null, 'claimed_until' => null, 'next_attempt_at' => null]);
+                if (! $finalization) {
+                    $turn->save();
+
+                    return AiTurnOutcome::FailureResolutionPending;
+                }
+            } elseif ($finalization) {
+                return AiTurnOutcome::NotEligible;
             }
 
             $token = (string) Str::uuid();
-            $turn->update(['state' => AiTurnState::Processing, 'claim_token' => $token, 'claimed_until' => now()->addSeconds($leaseSeconds)]);
+            $diagnostics = $turn->diagnostics;
+            if ($finalization) {
+                $diagnostics['finalization']['claim_count'] = ($diagnostics['finalization']['claim_count'] ?? 0) + 1;
+                $diagnostics['finalization']['last_claimed_at'] = now()->toAtomString();
+            } else {
+                $turn->attempt_count++;
+                $diagnostics['attempts'][$turn->attempt_count] = ['claimed_at' => now()->toAtomString()];
+            }
+            $turn->update([
+                'state' => $finalization ? AiTurnState::ResolvingFailure : AiTurnState::Processing,
+                'claim_token' => $token, 'claimed_until' => now()->addSeconds($leaseSeconds),
+                'next_attempt_at' => null, 'diagnostics' => $diagnostics,
+            ]);
 
             return new AiTurnClaim($turn->id, $token, $turn->inboundMessage);
         });
@@ -90,7 +145,8 @@ final class AiTurnCoordinator
      */
     public function complete(Business $business, AiTurnClaim $claim, string $content): ConversationMessage|AiTurnOutcome
     {
-        return $this->withOwnership($business, $claim, function (AiTurn $turn, Conversation $conversation) use ($business, $content): ConversationMessage {
+        return $this->withClaimOwnership($business, $claim, function (AiTurn $turn, Conversation $conversation) use ($business, $content): ConversationMessage {
+            $fallback = $turn->state === AiTurnState::ResolvingFailure;
             $proposal = AppointmentProposal::query()->where('conversation_id', $conversation->id)
                 ->where('originating_turn_id', $turn->id)->lockForUpdate()->first();
             $message = $this->conversations->assistant($business, $conversation->id, $content);
@@ -100,8 +156,11 @@ final class AiTurnCoordinator
             $turn->update([
                 'state' => AiTurnState::Completed, 'assistant_message_id' => $message->id,
                 'completed_at' => now(), 'claim_token' => null, 'claimed_until' => null,
+                'next_attempt_at' => null, 'fallback_used' => $fallback,
             ]);
-            if ($proposal?->state === AppointmentProposalState::Prepared) {
+            if ($fallback) {
+                $this->abandonProposals($conversation);
+            } elseif ($proposal?->state === AppointmentProposalState::Prepared) {
                 $proposal->update([
                     'state' => AppointmentProposalState::Pending,
                     'confirmation_request_message_id' => $message->id,
@@ -109,16 +168,53 @@ final class AiTurnCoordinator
             }
 
             return $message;
-        });
+        }, true);
     }
 
-    public function fail(Business $business, AiTurnClaim $claim): AiTurn|AiTurnOutcome
-    {
-        return $this->withOwnership($business, $claim, function (AiTurn $turn): AiTurn {
-            $turn->update(['state' => AiTurnState::Failed, 'claim_token' => null, 'claimed_until' => null]);
+    public function fail(
+        Business $business,
+        AiTurnClaim $claim,
+        AiTurnFailure $classification = AiTurnFailure::Recoverable,
+        AiTurnFailureReason $reason = AiTurnFailureReason::ProcessingFailed,
+        ?Throwable $exception = null,
+    ): AiTurn|AiTurnOutcome {
+        return $this->withClaimOwnership($business, $claim, function (AiTurn $turn) use ($classification, $reason, $exception): AiTurn {
+            if ($turn->state === AiTurnState::ResolvingFailure) {
+                $this->recordFinalizationFailure($turn, $classification, $reason, $exception);
+                $turn->fill([
+                    'state' => AiTurnState::FailureResolutionPending,
+                    'next_attempt_at' => now()->addSeconds(max(1, (int) config('conversation.processing.finalization_retry_seconds'))),
+                ]);
+            } else {
+                $this->recordFailure($turn, $classification, $reason, $exception);
+                $exhausted = $classification === AiTurnFailure::NonRecoverable
+                    || $turn->attempt_count >= max(1, (int) config('conversation.processing.max_attempts'));
+                $turn->fill([
+                    'state' => $exhausted ? AiTurnState::FailureResolutionPending : AiTurnState::Failed,
+                    'next_attempt_at' => $exhausted ? null : now()->addSeconds($this->retryDelay($turn->attempt_count)),
+                ]);
+            }
+            $turn->fill(['claim_token' => null, 'claimed_until' => null])->save();
 
             return $turn;
-        });
+        }, true);
+    }
+
+    /** Release FIFO only with a durable disposition and no reusable pending authorization. */
+    public function terminate(Business $business, AiTurnClaim $claim, AiTurnFailureReason $reason = AiTurnFailureReason::UnresolvedFailure): AiTurn|AiTurnOutcome
+    {
+        return $this->withClaimOwnership($business, $claim, function (AiTurn $turn, Conversation $conversation) use ($reason): AiTurn|AiTurnOutcome {
+            if ($turn->state !== AiTurnState::ResolvingFailure) {
+                return AiTurnOutcome::NotEligible;
+            }
+            $this->abandonProposals($conversation);
+            $turn->update([
+                'state' => AiTurnState::ClosedWithoutResponse, 'terminal_at' => now(), 'terminal_reason' => $reason,
+                'claim_token' => null, 'claimed_until' => null, 'next_attempt_at' => null,
+            ]);
+
+            return $turn;
+        }, true);
     }
 
     /** Run or resume one turn using a supplied generator, never inside a caller's transaction. */
@@ -132,13 +228,32 @@ final class AiTurnCoordinator
             return $claim;
         }
 
+        $reason = AiTurnFailureReason::GenerationFailed;
         try {
-            return $this->complete($business, $claim, $generate($claim));
+            $content = $generate($claim);
+            $reason = AiTurnFailureReason::ResponsePersistenceFailed;
+
+            return $this->complete($business, $claim, $content);
         } catch (Throwable $exception) {
-            $this->fail($business, $claim);
+            $nonRecoverable = $exception instanceof InsufficientCreditsException
+                || ($exception instanceof RequestException && in_array($exception->response->status(), [401, 403], true));
+            $this->fail($business, $claim, $nonRecoverable ? AiTurnFailure::NonRecoverable : AiTurnFailure::Recoverable,
+                reason: $reason, exception: $exception);
 
             throw $exception;
         }
+    }
+
+    /** Invalid configuration must not prevent recording the original processing failure. */
+    private function retryDelay(int $attempt): int
+    {
+        $delays = config('conversation.processing.retry_delays_seconds');
+        if (! is_array($delays) || $delays === [] || ! array_is_list($delays)
+            || array_filter($delays, fn (mixed $delay): bool => ! is_int($delay) || $delay < 1) !== []) {
+            $delays = [30, 120];
+        }
+
+        return $delays[min(max(0, $attempt - 1), count($delays) - 1)];
     }
 
     /** @return Collection<int, AiTurn>|AiTurnOutcome Completed pairs, not raw message insertion order. */
@@ -168,7 +283,13 @@ final class AiTurnCoordinator
      */
     public function withOwnership(Business $business, AiTurnClaim $claim, Closure $operation): mixed
     {
-        return DB::transaction(function () use ($business, $claim, $operation): mixed {
+        return $this->withClaimOwnership($business, $claim, $operation, false);
+    }
+
+    /** @see withOwnership */
+    private function withClaimOwnership(Business $business, AiTurnClaim $claim, Closure $operation, bool $allowFinalization): mixed
+    {
+        return DB::transaction(function () use ($business, $claim, $operation, $allowFinalization): mixed {
             $turn = AiTurn::query()->whereKey($claim->turnId)
                 ->whereHas('inboundMessage.conversation', fn (Builder $query) => $query->where('business_id', $business->id))->first();
             if (! $turn) {
@@ -177,20 +298,51 @@ final class AiTurnCoordinator
             $conversation = $turn->inboundMessage->conversation;
             $this->lock->acquire($business->id, $conversation->channel, $conversation->sender_identity);
             $turn = AiTurn::query()->lockForUpdate()->findOrFail($turn->id);
-            if ($turn->state !== AiTurnState::Processing || $turn->claim_token !== $claim->token
+            if (! in_array($turn->state, $allowFinalization ? [AiTurnState::Processing, AiTurnState::ResolvingFailure] : [AiTurnState::Processing], true) || $turn->claim_token !== $claim->token
                 || $turn->inbound_message_id !== $claim->inboundMessage->id) {
                 return AiTurnOutcome::StaleAttempt;
             }
             $current = $this->participant($business, $conversation->channel, $conversation->sender_identity)
                 ->orderByDesc('last_activity_at')->orderByDesc('id')->first();
             if ($current->id !== $conversation->id) {
-                $turn->update(['state' => AiTurnState::Superseded, 'claim_token' => null, 'claimed_until' => null]);
+                $turn->update(['state' => AiTurnState::Superseded, 'claim_token' => null, 'claimed_until' => null, 'next_attempt_at' => null]);
 
                 return AiTurnOutcome::Superseded;
             }
 
             return $operation($turn, $current);
         });
+    }
+
+    private function recordFailure(AiTurn $turn, AiTurnFailure $classification, AiTurnFailureReason $reason, ?Throwable $exception = null): void
+    {
+        $diagnostics = $turn->diagnostics;
+        $diagnostics['attempts'][$turn->attempt_count]['failure'] = [
+            'at' => now()->toAtomString(), 'classification' => $classification->value, 'reason' => $reason->value,
+            'exception_class' => $exception === null ? null : $exception::class,
+        ];
+        $turn->fill(['failure_classification' => $classification, 'failure_reason' => $reason, 'diagnostics' => $diagnostics]);
+    }
+
+    /** Keep finalization failures separate, retaining the original generation incident. */
+    private function recordFinalizationFailure(AiTurn $turn, AiTurnFailure $classification, AiTurnFailureReason $reason, ?Throwable $exception = null): void
+    {
+        $diagnostics = $turn->diagnostics;
+        $diagnostics['finalization']['failure_count'] = ($diagnostics['finalization']['failure_count'] ?? 0) + 1;
+        $diagnostics['finalization']['last_failure'] = [
+            'at' => now()->toAtomString(), 'classification' => $classification->value, 'reason' => $reason->value,
+            'exception_class' => $exception === null ? null : $exception::class,
+        ];
+        $turn->diagnostics = $diagnostics;
+    }
+
+    private function abandonProposals(Conversation $conversation): void
+    {
+        $proposals = AppointmentProposal::query()->where('conversation_id', $conversation->id)
+            ->whereIn('state', [AppointmentProposalState::Prepared, AppointmentProposalState::Pending])->lockForUpdate()->get();
+        foreach ($proposals as $proposal) {
+            $proposal->update(['state' => AppointmentProposalState::Rejected]);
+        }
     }
 
     private function participant(Business $business, string $channel, string $senderIdentity): Builder

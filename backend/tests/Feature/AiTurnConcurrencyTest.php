@@ -4,6 +4,7 @@ namespace Tests\Feature;
 
 use App\Application\Conversation\AiTurnClaim;
 use App\Application\Conversation\AiTurnCoordinator;
+use App\Application\Conversation\AiTurnOutcome;
 use App\Application\Conversation\AiTurnState;
 use App\Application\Conversation\AppointmentProposalOperation;
 use App\Application\Conversation\AppointmentProposalPayload;
@@ -195,6 +196,7 @@ class AiTurnConcurrencyTest extends TestCase
         $this->release($takeover);
         $new = $this->finish($takeover);
         $this->assertNotSame($old->token, $new['token']);
+        $this->assertSame(2, AiTurn::findOrFail($old->turnId)->attempt_count);
         $this->assertSame(['kind' => 'outcome', 'name' => 'StaleAttempt'], $this->finish($stale));
         $this->assertDatabaseCount('customers', 0);
         $accepted = $this->start('complete', ['turn' => $new['id'], 'token' => $new['token'], 'inbound' => $old->inboundMessage->id]);
@@ -204,7 +206,7 @@ class AiTurnConcurrencyTest extends TestCase
 
     public static function authorizedActions(): array
     {
-        return ['response completion' => ['complete'], 'write callback' => ['write']];
+        return ['response completion' => ['complete'], 'write callback' => ['write'], 'failure recording' => ['fail']];
     }
 
     public function test_write_callbacks_serialize_for_one_participant_without_blocking_another(): void
@@ -347,6 +349,7 @@ class AiTurnConcurrencyTest extends TestCase
         $interrupted = $this->start($processing, [], 'generate');
         $this->assertSame("generating\n", $this->line($interrupted));
         $this->assertSame(AiTurnState::Processing, $turn->fresh()->state);
+        $this->assertSame(1, $turn->fresh()->attempt_count);
         proc_terminate($this->workers[$interrupted]['process']);
         foreach ($this->workers[$interrupted]['pipes'] as $pipe) {
             fclose($pipe);
@@ -356,7 +359,78 @@ class AiTurnConcurrencyTest extends TestCase
         $recovery = $this->start($processing, [], '', '2030-01-01 12:05:00 UTC');
         $this->assertSame('message', $this->finish($recovery)['kind']);
         $this->assertSame(AiTurnState::Completed, $turn->fresh()->state);
+        $this->assertSame(2, $turn->fresh()->attempt_count);
         $this->assertDatabaseCount('conversation_messages', 2);
+    }
+
+    public function test_concurrent_last_attempt_takeovers_and_finalization_claims_cannot_exceed_the_budget(): void
+    {
+        $coordinator = app(AiTurnCoordinator::class);
+        $turn = $coordinator->inbound($this->business, 'web', 'sender', '1', 'hello');
+        $coordinator->claimNext($this->business, 'web', 'sender');
+        $this->travel(300)->seconds();
+        $coordinator->claimNext($this->business, 'web', 'sender');
+        $first = $this->start('claim', [], 'claim', '2030-01-01 12:10:00 UTC');
+        $this->assertSame("locked\n", $this->line($first));
+        $second = $this->start('claim', [], '', '2030-01-01 12:10:00 UTC');
+        $this->assertBlocked($first, $second);
+        $this->release($first);
+        $this->assertSame('claim', $this->finish($first)['kind']);
+        $this->assertSame(['kind' => 'outcome', 'name' => 'Busy'], $this->finish($second));
+        $this->assertSame(3, $turn->fresh()->attempt_count);
+        $this->travelTo(Carbon::parse('2030-01-01 12:15:00 UTC'));
+        $this->assertSame(AiTurnOutcome::FailureResolutionPending, $coordinator->claimNext($this->business, 'web', 'sender'));
+        $first = $this->start('claim_finalization', [], 'claim', '2030-01-01 12:15:00 UTC');
+        $this->assertSame("locked\n", $this->line($first));
+        $second = $this->start('claim_finalization', [], '', '2030-01-01 12:15:00 UTC');
+        $this->assertBlocked($first, $second);
+        $this->release($first);
+        $this->assertSame('claim', $this->finish($first)['kind']);
+        $this->assertSame(['kind' => 'outcome', 'name' => 'Busy'], $this->finish($second));
+        $this->assertSame(3, $turn->fresh()->attempt_count);
+        $this->assertSame(1, $turn->fresh()->diagnostics['finalization']['claim_count']);
+        $this->assertDatabaseCount('conversation_messages', 1);
+    }
+
+    public function test_killed_finalizer_is_recovered_without_another_model_attempt_or_duplicate_terminal_disposition(): void
+    {
+        $coordinator = app(AiTurnCoordinator::class);
+        $turn = $coordinator->inbound($this->business, 'web', 'sender', '1', 'hello');
+        for ($attempt = 1; $attempt <= 3; $attempt++) {
+            $claim = $coordinator->claimNext($this->business, 'web', 'sender');
+            $failed = $coordinator->fail($this->business, $claim);
+            if ($failed->next_attempt_at !== null) {
+                $this->travelTo($failed->next_attempt_at);
+            }
+        }
+        $time = now()->toAtomString();
+        $interrupted = $this->start('finalize', [], 'finalize', $time);
+        $this->assertSame("resolving_failure\n", $this->line($interrupted));
+        $old = $turn->fresh()->claim_token;
+        $this->assertSame(AiTurnState::ResolvingFailure, $turn->fresh()->state);
+        proc_terminate($this->workers[$interrupted]['process']);
+        foreach ($this->workers[$interrupted]['pipes'] as $pipe) {
+            fclose($pipe);
+        }
+        proc_close($this->workers[$interrupted]['process']);
+        unset($this->workers[$interrupted]);
+        $this->travel(300)->seconds();
+        $current = $coordinator->claimFinalizationNext($this->business, 'web', 'sender');
+        $this->assertNotSame($old, $current->token);
+        $this->assertSame(3, $turn->fresh()->attempt_count);
+        $this->assertSame(AiTurnOutcome::StaleAttempt, $coordinator->complete($this->business,
+            new AiTurnClaim($turn->id, $old, $turn->inboundMessage), 'obsolete'));
+        $first = $this->start('terminate', $this->claimData($current), 'claim', now()->toAtomString());
+        $this->assertSame("locked\n", $this->line($first));
+        $second = $this->start('terminate', $this->claimData($current), '', now()->toAtomString());
+        $this->assertBlocked($first, $second);
+        $this->release($first);
+        $this->assertSame('turn', $this->finish($first)['kind']);
+        $this->assertSame(['kind' => 'outcome', 'name' => 'StaleAttempt'], $this->finish($second));
+        $this->assertSame(AiTurnState::ClosedWithoutResponse, $turn->fresh()->state);
+        $this->assertNotNull($turn->fresh()->terminal_at);
+        $this->assertSame(3, $turn->fresh()->attempt_count);
+        $this->assertDatabaseCount('conversation_messages', 1);
     }
 
     public static function processingPaths(): array
@@ -783,6 +857,12 @@ class AiTurnConcurrencyTest extends TestCase
                     'inbound' => $coordinator->inbound($business, 'web', $sender, $data['message'], 'hello'),
                     'inbound_customer' => $coordinator->inbound($business, 'whatsapp', $sender, $data['message'], 'hello'),
                     'claim' => $coordinator->claimNext($business, 'web', $sender),
+                    'claim_finalization' => $coordinator->claimFinalizationNext($business, 'web', $sender),
+                    'finalize' => (function () use ($coordinator, $business, $sender, $wait) {
+                        $claim = $coordinator->claimFinalizationNext($business, 'web', $sender);
+                        $wait('resolving_failure');
+                        return $coordinator->terminate($business, $claim);
+                    })(),
                     'claim_customer' => $coordinator->claimNext($business, 'whatsapp', $sender),
                     'register_customer' => (new App\Application\Conversation\RegisterCustomerTool(
                         $business, new App\Application\Conversation\AiTurnClaim(
@@ -792,7 +872,13 @@ class AiTurnConcurrencyTest extends TestCase
                     ))->handle(new Laravel\Ai\Tools\Request(['first_name' => 'Ana', 'last_name' => 'García'])),
                     'complete' => $coordinator->complete($business, new App\Application\Conversation\AiTurnClaim(
                         $data['turn'], $data['token'], App\Models\ConversationMessage::findOrFail($data['inbound'])
-                     ), $data['content'] ?? 'answer'),
+                      ), $data['content'] ?? 'answer'),
+                    'fail' => $coordinator->fail($business, new App\Application\Conversation\AiTurnClaim(
+                        $data['turn'], $data['token'], App\Models\ConversationMessage::findOrFail($data['inbound'])
+                    )),
+                    'terminate' => $coordinator->terminate($business, new App\Application\Conversation\AiTurnClaim(
+                        $data['turn'], $data['token'], App\Models\ConversationMessage::findOrFail($data['inbound'])
+                    )),
                     'write' => $coordinator->withOwnership($business, new App\Application\Conversation\AiTurnClaim(
                         $data['turn'], $data['token'], App\Models\ConversationMessage::findOrFail($data['inbound'])
                     ), function (App\Models\AiTurn $turn, App\Models\Conversation $conversation) use ($barrier, $wait): array {

@@ -158,6 +158,9 @@ final class AppointmentOperationsEvaluationRunner
         if (! $turn instanceof AiTurn) {
             throw new RuntimeException('evaluation_fixture_mismatch');
         }
+        if (($specification['resume'] ?? false) && $turn->fresh()->next_attempt_at?->isFuture()) {
+            Carbon::setTestNow($turn->fresh()->next_attempt_at);
+        }
         $this->lastTurn = $turn;
         $this->current['turn_id'] = $turn->id;
         $this->provider->beginAttempt();

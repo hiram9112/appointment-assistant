@@ -134,6 +134,7 @@ class AppointmentProposalsTest extends TestCase
         $this->assertSame(AppointmentProposalOutcome::NotFound, $this->proposals->recover($this->business, $this->claim));
         $new = $this->prepare();
         $this->turns->fail($this->business, $this->claim);
+        $this->travelTo(AiTurn::findOrFail($this->claim->turnId)->next_attempt_at);
         $this->claim = $this->turns->claimNext($this->business, 'whatsapp', 'sender');
         $this->assertSame($new->id, $this->proposals->recover($this->business, $this->claim)->id);
         $this->assertSame($new->id, $this->prepare()->id);

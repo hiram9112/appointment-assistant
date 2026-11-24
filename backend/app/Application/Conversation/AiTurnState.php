@@ -8,5 +8,8 @@ enum AiTurnState: string
     case Processing = 'processing';
     case Completed = 'completed';
     case Failed = 'failed';
+    case FailureResolutionPending = 'failure_resolution_pending';
+    case ResolvingFailure = 'resolving_failure';
+    case ClosedWithoutResponse = 'closed_without_response';
     case Superseded = 'superseded';
 }

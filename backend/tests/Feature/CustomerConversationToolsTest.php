@@ -307,6 +307,7 @@ class CustomerConversationToolsTest extends TestCase
     public function test_committed_registration_recovers_after_provider_or_response_persistence_failure(string $failure): void
     {
         $this->turns->fail($this->business, $this->claim);
+        $this->travelTo(AiTurn::findOrFail($this->claim->turnId)->next_attempt_at);
         if ($failure === 'assistant') {
             ConversationMessage::creating(function (ConversationMessage $message): void {
                 if ($message->role === 'assistant') {
@@ -334,6 +335,7 @@ class CustomerConversationToolsTest extends TestCase
             ConversationMessage::flushEventListeners();
         }
         $this->assertSame(AiTurnState::Failed, AiTurn::findOrFail($this->claim->turnId)->state);
+        $this->travelTo(AiTurn::findOrFail($this->claim->turnId)->next_attempt_at);
         $this->assertSame($customerId, $this->conversation()->customer_id);
         $this->assertDatabaseCount('conversation_messages', 1);
         $response = $this->turns->processNext($this->business, 'whatsapp', 'sender', function (AiTurnClaim $claim) use ($customerId): string {

@@ -36,6 +36,7 @@ use Illuminate\Database\Events\TransactionRolledBack;
 use Illuminate\Database\QueryException;
 use Illuminate\Foundation\Testing\DatabaseMigrations;
 use Illuminate\JsonSchema\JsonSchemaTypeFactory;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Laravel\Ai\Prompts\AgentPrompt;
 use Laravel\Ai\Tools\Request;
@@ -138,6 +139,7 @@ class ConfirmAppointmentProposalTest extends TestCase
         $proposalBefore = $proposal->fresh()->getAttributes();
 
         $this->turns->fail($this->business, $this->claim);
+        Carbon::setTestNow(AiTurn::findOrFail($this->claim->turnId)->next_attempt_at);
         $this->assertSame($turn->id, $this->turns->inbound($this->business, 'whatsapp', 'sender', 'confirmation-delivery', $content)->id);
         $this->claim = $this->turns->claimNext($this->business, 'whatsapp', 'sender');
         $this->assertSame($firstClaim->turnId, $this->claim->turnId);
@@ -255,6 +257,7 @@ class ConfirmAppointmentProposalTest extends TestCase
         $this->assertNull(app(ConfirmAppointmentProposal::class)->recover($this->business, $this->claim));
         $this->assertSame(['status' => 'identification_failed'], $this->invoke(['decision' => 'confirm']));
         $this->turns->fail($this->business, $this->claim);
+        Carbon::setTestNow(AiTurn::findOrFail($this->claim->turnId)->next_attempt_at);
         ChannelIdentity::query()->where('external_id', 'sender')->update(['customer_id' => $this->customer->id]);
         $this->claim = $this->turns->claimNext($this->business, 'whatsapp', 'sender');
         $this->assertSame($result, app(ConfirmAppointmentProposal::class)->recover($this->business, $this->claim));
@@ -531,6 +534,7 @@ class ConfirmAppointmentProposalTest extends TestCase
         $this->assertSame($outcome, $result['outcome']);
         $this->claim->inboundMessage->update(['content' => 'Please explain the outcome in English.']);
         $this->turns->fail($this->business, $this->claim);
+        Carbon::setTestNow(AiTurn::findOrFail($this->claim->turnId)->next_attempt_at);
         $generated = 'No appointment changes were made.';
         ConversationAgent::fake([$generated])->preventStrayPrompts();
         $message = app(ConversationTurnProcessor::class)->processNext($this->business, 'whatsapp', 'sender');
@@ -717,6 +721,7 @@ class ConfirmAppointmentProposalTest extends TestCase
         $confirmation = 'Yes, please confirm that appointment operation.';
         $this->claim->inboundMessage->update(['content' => $confirmation]);
         $this->turns->fail($this->business, $this->claim);
+        Carbon::setTestNow(AiTurn::findOrFail($this->claim->turnId)->next_attempt_at);
         $stored = null;
         ConversationAgent::fake(function () use (&$stored, $failure): string {
             $this->assertSame(0, DB::transactionLevel());
@@ -741,6 +746,7 @@ class ConfirmAppointmentProposalTest extends TestCase
         $this->assertSame('completed', $stored['status']);
         $this->assertSame($stored, $proposal->fresh()->result);
         $this->assertSame(AiTurnState::Failed, AiTurn::findOrFail($this->claim->turnId)->state);
+        Carbon::setTestNow(AiTurn::findOrFail($this->claim->turnId)->next_attempt_at);
         $this->service->update(['name' => 'Changed catalogue', 'active' => false]);
         Appointment::sole()->update(['status' => 'completed']);
         $this->app->instance(AppointmentOccupancy::class, new class implements ReschedulingAppointmentOccupancy

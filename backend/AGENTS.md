@@ -37,6 +37,7 @@ This project has domain-specific skills available in `**/skills/**`. You MUST ac
 ## Documentation Files
 
 - You must only create documentation files if explicitly requested by the user.
+- Update `.env.example` when adding or renaming a project-specific environment variable in `config/`. Laravel's built-in variables do not require exhaustive documentation.
 
 === boost rules ===
 

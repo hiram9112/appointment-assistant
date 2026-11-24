@@ -84,6 +84,7 @@ class AiTurnCoordinatorTest extends TestCase
         $this->assertSame($first->id, $claim->inboundMessage->id);
         $this->assertSame(AiTurnOutcome::Busy, $this->claim());
         $this->coordinator->fail($this->business, $claim);
+        Carbon::setTestNow(AiTurn::findOrFail($claim->turnId)->next_attempt_at);
         $retry = $this->claim();
         $this->assertSame($claim->turnId, $retry->turnId);
         $this->assertNotSame($claim->token, $retry->token);
@@ -98,6 +99,7 @@ class AiTurnCoordinatorTest extends TestCase
         $claim = $this->claim();
         $this->assertSame(AiTurnState::Failed, $this->coordinator->fail($this->business, $claim)->state);
         $this->assertDatabaseCount('conversation_messages', 2);
+        Carbon::setTestNow($first->fresh()->next_attempt_at);
         $retry = $this->claim();
         $this->assertSame($first->id, $retry->turnId);
         $this->assertSame(AiTurnOutcome::StaleAttempt, $this->coordinator->fail($this->business, $claim));
@@ -261,6 +263,7 @@ class AiTurnCoordinatorTest extends TestCase
         }
         $this->assertSame(AiTurnState::Failed, $turn->fresh()->state);
         $this->assertDatabaseCount('conversation_messages', 1);
+        Carbon::setTestNow($turn->fresh()->next_attempt_at);
         $answer = $this->coordinator->processNext($this->business, 'web', 'sender', function (): string {
             $this->assertSame(0, DB::transactionLevel());
 
@@ -436,6 +439,7 @@ class AiTurnCoordinatorTest extends TestCase
         $this->assertSame(AiTurnState::Failed, $turn->fresh()->state);
         $this->assertNull($turn->fresh()->assistant_message_id);
         $this->assertDatabaseCount('conversation_messages', 1);
+        Carbon::setTestNow($turn->fresh()->next_attempt_at);
         $this->assertSame($turn->id, $this->claim()->turnId);
     }
 

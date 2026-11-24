@@ -331,6 +331,7 @@ class ConversationTurnProcessorTest extends TestCase
         $this->assertDatabaseCount('conversation_messages', 2);
 
         ConversationAgent::fake(['Recovered answer'])->preventStrayPrompts();
+        $this->travelTo($first->fresh()->next_attempt_at);
         $answer = $this->process();
         $this->assertSame($answer->id, $first->fresh()->assistant_message_id);
         $this->assertSame(AiTurnState::Pending, $later->fresh()->state);
@@ -354,6 +355,7 @@ class ConversationTurnProcessorTest extends TestCase
         $this->assertNull($turn->fresh()->assistant_message_id);
         $this->assertDatabaseCount('conversation_messages', 1);
         ConversationAgent::fake(['Recovered answer'])->preventStrayPrompts();
+        $this->travelTo($turn->fresh()->next_attempt_at);
         $this->assertSame('Recovered answer', $this->process()->content);
     }
 
@@ -381,6 +383,7 @@ class ConversationTurnProcessorTest extends TestCase
         $this->assertSame(AiTurnOutcome::Busy, $this->process());
         ConversationAgent::assertNeverPrompted();
         $this->turns->fail($this->business, $claim);
+        $this->travelTo($turn->fresh()->next_attempt_at);
         $this->process();
         $duplicate = $this->inbound('1', 'Question');
         $this->assertSame($turn->id, $duplicate->id);

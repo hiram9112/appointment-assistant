@@ -379,6 +379,7 @@ class ConversationAppointmentAgentTest extends TestCase
         $payload = $proposal->payload;
         $result = $proposal->result;
         $this->assertSame(AiTurnState::Failed, $turn->fresh()->state);
+        $this->travelTo($turn->fresh()->next_attempt_at);
         $this->assertSame($phase, $proposal->state->value);
         $this->assertSame($phase === 'prepared' ? 0 : 1, Appointment::count());
         $this->service->update(['active' => false, 'name' => 'Changed catalogue']);
@@ -489,6 +490,7 @@ class ConversationAppointmentAgentTest extends TestCase
         $customer = Customer::sole();
         $this->assertSame($customer->id, $turn->inboundMessage->conversation->customer_id);
         $this->assertSame(AiTurnState::Failed, $turn->fresh()->state);
+        $this->travelTo($turn->fresh()->next_attempt_at);
         ConversationAgent::fake([
             $this->toolCall('GetCustomerAppointmentsTool'),
             $this->toolCall('PrepareCreateAppointmentTool', $this->createArguments()),
@@ -542,6 +544,7 @@ class ConversationAppointmentAgentTest extends TestCase
         $this->assertDatabaseCount('appointment_audits', 0);
 
         ChannelIdentity::query()->where('external_id', 'sender')->update(['customer_id' => $customer->id]);
+        $this->travelTo($turn->fresh()->next_attempt_at);
         ConversationAgent::fake([$this->toolCall('ConfirmAppointmentProposalTool', ['decision' => 'confirm']), 'Tu cita está reservada.'])->preventStrayPrompts();
         $this->process();
         ConversationAgent::assertPrompted(function (AgentPrompt $prompt) use ($customer, $proposal): bool {
@@ -644,6 +647,7 @@ class ConversationAppointmentAgentTest extends TestCase
             }
             $this->assertSame(AiTurnState::Failed, $turn->fresh()->state);
             $this->assertNull($origin->inboundMessage->conversation->fresh()->customer_id);
+            $this->travelTo($turn->fresh()->next_attempt_at);
         }
         ConversationAgent::assertNeverPrompted();
         $this->assertSame($private, $origin->fresh()->assistantMessage->content);
@@ -657,7 +661,7 @@ class ConversationAppointmentAgentTest extends TestCase
     {
         $customer = $this->identify();
         $this->prepare();
-        $this->inbound($phase === 'prepared' ? 'Mejor a las doce.' : 'Sí, confirmo.');
+        $turn = $this->inbound($phase === 'prepared' ? 'Mejor a las doce.' : 'Sí, confirmo.');
         ConversationAgent::fake([
             $this->toolCall(
                 $phase === 'prepared' ? 'PrepareCreateAppointmentTool' : 'ConfirmAppointmentProposalTool',
@@ -680,6 +684,7 @@ class ConversationAppointmentAgentTest extends TestCase
             ChannelIdentity::query()->where('customer_id', $customer->id)->update(['customer_id' => Customer::factory()->create()->id]);
         }
         $responsesBeforeRetry = count($this->responses);
+        $this->travelTo($turn->fresh()->next_attempt_at);
         ConversationAgent::fake([
             $this->toolCall('ConfirmAppointmentProposalTool', ['decision' => 'confirm']),
             $this->toolCall('PrepareCreateAppointmentTool', $this->createArguments()),
@@ -704,6 +709,7 @@ class ConversationAppointmentAgentTest extends TestCase
             ChannelIdentity::query()->where('external_id', 'sender')->update(['customer_id' => $customer->id]);
         }
         ConversationAgent::fake(['Respuesta recuperada para el cliente correcto.'])->preventStrayPrompts();
+        $this->travelTo($turn->fresh()->next_attempt_at);
         $this->process();
         ConversationAgent::assertPrompted(function (AgentPrompt $prompt) use ($phase, $customer, $proposal): bool {
             $context = $this->context($prompt);
