@@ -43,6 +43,10 @@
             "Composer\\Config::disableProcessTimeout",
             "@php artisan serve"
         ],
+        "dev:worker": [
+            "Composer\\Config::disableProcessTimeout",
+            "@php artisan queue:work redis --timeout=240 --tries=1 --no-interaction"
+        ],
         "test": [
             "@php artisan config:clear --ansi @no_additional_args",
             "@php artisan test"

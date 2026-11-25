@@ -25,8 +25,9 @@ final class ConversationTurnProcessor
     ) {}
 
     /** Process or resume one participant's next turn; identities come from trusted application code. */
-    public function processNext(Business $business, string $channel, string $senderIdentity, int $leaseSeconds = 300): ConversationMessage|AiTurnOutcome
-    {
+    public function processNext(
+        Business $business, string $channel, string $senderIdentity, int $leaseSeconds = 300, ?int $expectedConversationId = null,
+    ): ConversationMessage|AiTurnOutcome {
         return $this->turns->processNext($business, $channel, $senderIdentity, function (AiTurnClaim $claim) use ($business): string {
             $executionContext = $this->executionContext($business, $claim);
             if ($executionContext instanceof AiTurnOutcome) {
@@ -59,7 +60,7 @@ final class ConversationTurnProcessor
                 ),
             )->withMessages($this->history->completedTurns($completed))
                 ->prompt($claim->inboundMessage->content)->text;
-        }, $leaseSeconds);
+        }, $leaseSeconds, $expectedConversationId);
     }
 
     /**

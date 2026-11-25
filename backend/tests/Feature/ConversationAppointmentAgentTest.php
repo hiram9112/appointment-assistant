@@ -8,6 +8,7 @@ use App\Application\Conversation\AiTurnState;
 use App\Application\Conversation\AppointmentProposalState;
 use App\Application\Conversation\ConversationAgent;
 use App\Application\Conversation\ConversationTurnProcessor;
+use App\Jobs\ProcessConversationTurn;
 use App\Models\AiTurn;
 use App\Models\Appointment;
 use App\Models\AppointmentAudit;
@@ -23,6 +24,7 @@ use App\Models\Service;
 use Illuminate\Foundation\Testing\DatabaseMigrations;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Queue;
 use Laravel\Ai\Contracts\ConversationStore;
 use Laravel\Ai\Events\AgentPrompted;
 use Laravel\Ai\Messages\Message;
@@ -185,6 +187,32 @@ class ConversationAppointmentAgentTest extends TestCase
     public static function registrationStates(): array
     {
         return ['registered' => [true], 'registration without phone' => [false]];
+    }
+
+    public function test_duplicate_jobs_do_not_repeat_a_confirmed_appointment_or_audit(): void
+    {
+        $this->identify();
+        $proposal = $this->prepare();
+        Queue::fake();
+        $confirming = $this->inbound('Sí, confirmo la reserva.');
+        ConversationAgent::fake([
+            $this->toolCall('ConfirmAppointmentProposalTool', ['decision' => 'confirm']),
+            'Tu cita está reservada.',
+        ])->preventStrayPrompts();
+        $processor = app(ConversationTurnProcessor::class);
+        $job = Queue::pushed(ProcessConversationTurn::class)->sole();
+
+        $job->handle($processor);
+        $job->handle($processor);
+
+        $this->assertSame($confirming->id, $proposal->fresh()->confirming_turn_id);
+        $this->assertSame('Tu cita está reservada.', $confirming->refresh()->assistantMessage->content);
+        $this->assertSame(1, $confirming->attempt_count);
+        $this->assertDatabaseCount('appointments', 1);
+        $this->assertDatabaseCount('appointment_audits', 1);
+        $this->assertDatabaseCount('conversation_messages', 4);
+        ConversationAgent::assertPromptedTimes(2);
+        Queue::assertPushedOnce(ProcessConversationTurn::class);
     }
 
     #[DataProvider('replies')]

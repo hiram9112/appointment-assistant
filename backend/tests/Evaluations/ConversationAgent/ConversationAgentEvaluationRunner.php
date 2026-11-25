@@ -89,6 +89,9 @@ final class ConversationAgentEvaluationRunner
         if (DB::selectOne('select current_database() as name')->name !== $database) {
             throw new RuntimeException('smoke_database_guard');
         }
+
+        // Evaluation turns run inline and must never reach the development worker.
+        config(['queue.default' => 'null']);
     }
 
     /** Seed only after the CLI has guarded and migrated the dedicated database. */

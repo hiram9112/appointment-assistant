@@ -2,6 +2,7 @@
 
 namespace App\Application\Conversation;
 
+use App\Jobs\ProcessConversationTurn;
 use App\Models\AiTurn;
 use App\Models\AppointmentProposal;
 use App\Models\Business;
@@ -37,7 +38,13 @@ final class AiTurnCoordinator
 
             $this->lock->acquire($business->id, $channel, $senderIdentity);
 
-            return AiTurn::query()->firstOrCreate(['inbound_message_id' => $message->id]);
+            $turn = AiTurn::query()->firstOrCreate(['inbound_message_id' => $message->id]);
+            if ($turn->wasRecentlyCreated) {
+                $conversationId = $message->conversation_id;
+                DB::afterCommit(static fn () => ProcessConversationTurn::enqueue($conversationId));
+            }
+
+            return $turn;
         });
     }
 
@@ -45,9 +52,10 @@ final class AiTurnCoordinator
      * Internal re-entry: also recover S10 messages persisted without turn registration.
      * Inbound IDs reflect insertion order under S10's participant lock, unlike timestamps.
      */
-    public function claimNext(Business $business, string $channel, string $senderIdentity, int $leaseSeconds = 300): AiTurnClaim|AiTurnOutcome
-    {
-        return $this->claim($business, $channel, $senderIdentity, $leaseSeconds, false);
+    public function claimNext(
+        Business $business, string $channel, string $senderIdentity, int $leaseSeconds = 300, ?int $expectedConversationId = null,
+    ): AiTurnClaim|AiTurnOutcome {
+        return $this->claim($business, $channel, $senderIdentity, $leaseSeconds, false, $expectedConversationId);
     }
 
     /** Finalization can accept a response or terminate work, but cannot authorize AI tools. */
@@ -56,18 +64,22 @@ final class AiTurnCoordinator
         return $this->claim($business, $channel, $senderIdentity, $leaseSeconds, true);
     }
 
-    private function claim(Business $business, string $channel, string $senderIdentity, int $leaseSeconds, bool $finalization): AiTurnClaim|AiTurnOutcome
-    {
+    private function claim(
+        Business $business, string $channel, string $senderIdentity, int $leaseSeconds, bool $finalization, ?int $expectedConversationId = null,
+    ): AiTurnClaim|AiTurnOutcome {
         if ($leaseSeconds < 1) {
             throw new InvalidArgumentException('The processing lease must be positive.');
         }
 
-        return DB::transaction(function () use ($business, $channel, $senderIdentity, $leaseSeconds, $finalization): AiTurnClaim|AiTurnOutcome {
+        return DB::transaction(function () use ($business, $channel, $senderIdentity, $leaseSeconds, $finalization, $expectedConversationId): AiTurnClaim|AiTurnOutcome {
             $this->lock->acquire($business->id, $channel, $senderIdentity);
             $conversations = $this->participant($business, $channel, $senderIdentity);
             $current = (clone $conversations)->orderByDesc('last_activity_at')->orderByDesc('id')->first();
             if (! $current) {
                 return AiTurnOutcome::Idle;
+            }
+            if ($expectedConversationId !== null && $current->id !== $expectedConversationId) {
+                return AiTurnOutcome::Superseded;
             }
 
             $messages = ConversationMessage::query()->whereIn('conversation_id', (clone $conversations)->select('id'))
@@ -218,12 +230,13 @@ final class AiTurnCoordinator
     }
 
     /** Run or resume one turn using a supplied generator, never inside a caller's transaction. */
-    public function processNext(Business $business, string $channel, string $senderIdentity, Closure $generate, int $leaseSeconds = 300): ConversationMessage|AiTurnOutcome
-    {
+    public function processNext(
+        Business $business, string $channel, string $senderIdentity, Closure $generate, int $leaseSeconds = 300, ?int $expectedConversationId = null,
+    ): ConversationMessage|AiTurnOutcome {
         if (DB::transactionLevel() !== 0) {
             throw new LogicException('AI generation must run outside database transactions.');
         }
-        $claim = $this->claimNext($business, $channel, $senderIdentity, $leaseSeconds);
+        $claim = $this->claimNext($business, $channel, $senderIdentity, $leaseSeconds, $expectedConversationId);
         if ($claim instanceof AiTurnOutcome) {
             return $claim;
         }

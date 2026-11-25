@@ -100,6 +100,16 @@ Start the Laravel development server from `backend/`:
 php artisan serve
 ```
 
+In a separate terminal, run one conversation worker from `backend/` with
+`composer dev:worker`. Keep `QUEUE_CONNECTION=redis` and make sure Redis is running.
+The CLI PHP runtime needs the `redis` and `pcntl` extensions.
+The AI SDK allows up to 60 seconds per provider request. The Job caps the entire
+turn (which may make multiple requests) at 240 seconds, below the default
+270-second Redis reservation and 300-second PostgreSQL claim lease. Keep
+`REDIS_QUEUE_RETRY_AFTER` above the Job timeout. The worker does not retry a Job
+on failure; PostgreSQL retains the turn for later recovery. Scheduled recovery
+is not wired up yet.
+
 ## Tests
 
 Run the backend test suite:
