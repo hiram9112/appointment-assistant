@@ -3,7 +3,6 @@
 namespace Tests\Feature;
 
 use App\Application\Conversation\AiTurnCoordinator;
-use App\Application\Conversation\AiTurnOutcome;
 use App\Application\Conversation\AiTurnState;
 use App\Application\Conversation\ConversationAgent;
 use App\Application\Conversation\ConversationOutcome;
@@ -189,7 +188,7 @@ class ConversationQueueTest extends TestCase
         ConversationAgent::assertPromptedTimes(1);
     }
 
-    public function test_not_due_and_exhausted_work_does_not_generate_or_schedule_queue_retries(): void
+    public function test_not_due_and_exhausted_work_does_not_generate_and_fallback_queues_backlog(): void
     {
         Queue::fake();
         config(['conversation.processing.max_attempts' => 2]);
@@ -209,21 +208,19 @@ class ConversationQueueTest extends TestCase
         $turns->fail($this->business, $turns->claimNext($this->business, 'web', 'sender'));
 
         $job->handle($processor);
-        $this->assertSame(AiTurnState::FailureResolutionPending, $first->refresh()->state);
+        $this->assertSame(AiTurnState::Completed, $first->refresh()->state);
+        $this->assertTrue($first->fallback_used);
         $this->assertSame(2, $first->attempt_count);
         $this->assertSame(0, $second->fresh()->attempt_count);
-        Queue::assertPushedTimes(ProcessConversationTurn::class, 2);
+        Queue::assertPushedTimes(ProcessConversationTurn::class, 3);
         ConversationAgent::assertNeverPrompted();
 
-        $claim = $turns->claimFinalizationNext($this->business, 'web', 'sender');
-        $this->assertNotInstanceOf(AiTurnOutcome::class, $claim);
-        $turns->terminate($this->business, $claim);
         ConversationAgent::fake(['Second answer'])->preventStrayPrompts();
 
-        $job->handle($processor);
-        $this->assertSame(AiTurnState::ClosedWithoutResponse, $first->fresh()->state);
+        Queue::pushed(ProcessConversationTurn::class)->last()->handle($processor);
         $this->assertSame('Second answer', $second->fresh()->assistantMessage->content);
-        Queue::assertPushedTimes(ProcessConversationTurn::class, 2);
+        Queue::assertPushedTimes(ProcessConversationTurn::class, 3);
+        ConversationAgent::assertPromptedTimes(1);
     }
 
     private function inbound(string $content, string $sender = 'sender', ?Business $business = null): AiTurn

@@ -8,6 +8,8 @@ use App\Application\Availability\ReschedulingAppointmentOccupancy;
 use App\Application\Availability\TimeInterval;
 use App\Application\Conversation\AiTurnClaim;
 use App\Application\Conversation\AiTurnCoordinator;
+use App\Application\Conversation\AiTurnFailure;
+use App\Application\Conversation\AiTurnFailureReason;
 use App\Application\Conversation\AiTurnOutcome;
 use App\Application\Conversation\AiTurnState;
 use App\Application\Conversation\AppointmentProposalOperation;
@@ -809,6 +811,118 @@ class ConfirmAppointmentProposalTest extends TestCase
         }
 
         return $cases;
+    }
+
+    #[DataProvider('emergencyOutcomes')]
+    public function test_exhaustion_reports_the_exact_committed_outcome_without_repeating_the_operation(
+        string $operation, string $outcome, string $expectedResponse, int $audits,
+    ): void {
+        config(['conversation.processing.max_attempts' => 2]);
+        $arguments = [];
+        if ($outcome === 'unchanged') {
+            $arguments['appointment_id'] = $this->appointment('2030-02-01 10:00:17 UTC')->id;
+        }
+        $proposal = $this->pending($operation, $arguments);
+        $turn = AiTurn::findOrFail($this->claim->turnId);
+        $this->turns->fail($this->business, $this->claim);
+        $this->travelTo($turn->fresh()->next_attempt_at);
+        if ($outcome === 'slot_unavailable') {
+            $this->appointment('2030-02-01 10:00:17 UTC');
+        }
+
+        ConversationAgent::fake(function () use ($turn, $outcome): never {
+            $turn->refresh();
+            $this->claim = new AiTurnClaim($turn->id, $turn->claim_token, $turn->inboundMessage);
+            $this->assertSame($outcome, $this->invoke(['decision' => $outcome === 'declined' ? 'decline' : 'confirm'])['outcome']);
+
+            throw new RuntimeException('Provider failed after the operation result was committed.');
+        })->preventStrayPrompts();
+        $processor = app(ConversationTurnProcessor::class);
+        try {
+            $processor->processNext($this->business, 'whatsapp', 'sender');
+            $this->fail('The last provider attempt must report its original error.');
+        } catch (RuntimeException $exception) {
+            $this->assertSame('Provider failed after the operation result was committed.', $exception->getMessage());
+        }
+        $turn->refresh();
+        $this->assertSame(AiTurnState::FailureResolutionPending, $turn->state);
+        $attempts = $turn->diagnostics['attempts'];
+        $persisted = $proposal->fresh()->result;
+        $this->assertSame($outcome, $persisted['outcome']);
+
+        $this->service->update(['name' => 'New service name']);
+        $this->professional->update(['display_name' => 'New professional name']);
+        $this->business->update(['timezone' => 'UTC']);
+        Appointment::query()->update(['starts_at' => '2030-02-08 14:00:00 UTC', 'ends_at' => '2030-02-08 15:00:00 UTC']);
+        $appointments = Appointment::all()->map->getAttributes()->all();
+
+        $response = $processor->processNext($this->business, 'whatsapp', 'sender');
+
+        $this->assertInstanceOf(ConversationMessage::class, $response);
+        $this->assertSame($expectedResponse, $response->content);
+        $this->assertSame($response->id, $turn->refresh()->assistant_message_id);
+        $this->assertSame(AiTurnState::Completed, $turn->state);
+        $this->assertTrue($turn->fallback_used);
+        $this->assertSame(2, $turn->attempt_count);
+        $this->assertSame(AiTurnFailureReason::GenerationFailed, $turn->failure_reason);
+        $this->assertSame($attempts, $turn->diagnostics['attempts']);
+        $this->assertSame(RuntimeException::class, $attempts[2]['failure']['exception_class']);
+        $this->assertSame(AiTurnOutcome::Idle, $processor->processNext($this->business, 'whatsapp', 'sender'));
+        $this->assertSame($persisted, $proposal->fresh()->result);
+        $this->assertSame($appointments, Appointment::all()->map->getAttributes()->all());
+        $this->assertDatabaseCount('appointment_audits', $audits);
+        $this->assertDatabaseCount('conversation_messages', 4);
+        ConversationAgent::assertPromptedTimes(1);
+    }
+
+    public static function emergencyOutcomes(): array
+    {
+        $details = ' Servicio: Consulta. Profesional: Laura. Fecha y hora: 01/02/2030 a las 11:00:17.';
+
+        return [
+            'created' => ['create', 'created', 'Tu cita ha quedado reservada.'.$details, 1],
+            'rescheduled' => ['reschedule', 'rescheduled', 'Tu cita ha sido reprogramada.'.$details, 1],
+            'cancelled' => ['cancel', 'cancelled', 'Tu cita ha sido cancelada.'.$details, 1],
+            'unchanged' => ['reschedule', 'unchanged', 'Tu cita no ha cambiado.'.$details, 0],
+            'declined' => ['create', 'declined', 'Has rechazado la propuesta. No se realizó ningún cambio.', 0],
+            'unavailable' => ['create', 'slot_unavailable', 'El horario solicitado ya no está disponible. No se realizó ningún cambio.', 0],
+        ];
+    }
+
+    public function test_emergency_response_does_not_reuse_results_from_other_turns_businesses_or_customers(): void
+    {
+        $proposal = $this->pending('create');
+        $stored = $this->invoke(['decision' => 'confirm']);
+        $this->assertSame('created', $stored['outcome']);
+        $this->turns->fail($this->business, $this->claim, AiTurnFailure::NonRecoverable);
+        $otherBusiness = Business::factory()->create();
+        $otherCustomer = Customer::factory()->create();
+        ChannelIdentity::factory()->for($otherCustomer)->create(['external_id' => 'other']);
+        $this->turns->inbound($otherBusiness, 'whatsapp', 'sender', '1', 'Sí');
+        $this->turns->inbound($this->business, 'whatsapp', 'other', '1', 'Sí');
+        foreach ([[$otherBusiness, 'sender'], [$this->business, 'other']] as [$business, $sender]) {
+            $this->turns->fail($business, $this->turns->claimNext($business, 'whatsapp', $sender), AiTurnFailure::NonRecoverable);
+        }
+        ChannelIdentity::query()->where('external_id', 'sender')->update(['customer_id' => $otherCustomer->id]);
+        ConversationAgent::fake([])->preventStrayPrompts();
+        $processor = app(ConversationTurnProcessor::class);
+
+        foreach ([[$otherBusiness, 'sender'], [$this->business, 'other'], [$this->business, 'sender']] as [$business, $sender]) {
+            $response = $processor->processNext($business, 'whatsapp', $sender);
+            $this->assertInstanceOf(ConversationMessage::class, $response);
+            $this->assertSame('No pudimos completar tu solicitud. Puedes volver a intentarlo.', $response->content);
+        }
+
+        ChannelIdentity::query()->where('external_id', 'sender')->update(['customer_id' => $this->customer->id]);
+        $later = $this->turns->inbound($this->business, 'whatsapp', 'sender', 'later', 'Sí, otra vez');
+        $this->turns->fail($this->business, $this->turns->claimNext($this->business, 'whatsapp', 'sender'), AiTurnFailure::NonRecoverable);
+        $response = $processor->processNext($this->business, 'whatsapp', 'sender');
+        $this->assertSame('No pudimos completar tu solicitud. Puedes volver a intentarlo.', $response->content);
+        $this->assertSame($response->id, $later->fresh()->assistant_message_id);
+        $this->assertSame($stored, $proposal->fresh()->result);
+        $this->assertDatabaseCount('appointments', 1);
+        $this->assertDatabaseCount('appointment_audits', 1);
+        ConversationAgent::assertNeverPrompted();
     }
 
     #[DataProvider('bookingOperations')]

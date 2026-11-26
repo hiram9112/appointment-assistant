@@ -131,14 +131,14 @@ class ConversationReconciliationTest extends TestCase
         $turns = app(AiTurnCoordinator::class);
         $lastAttempt = $this->inbound($business, 'interrupted last attempt');
         $turns->claimNext($business, 'web', 'sender', leaseSeconds: 60);
-        $this->inbound($business, 'waiting behind exhaustion');
+        $backlog = $this->inbound($business, 'waiting behind exhaustion');
         $pending = $this->inbound($business, 'exhausted', sender: 'pending');
         $turns->fail($business, $turns->claimNext($business, 'web', 'pending'));
         $expired = $this->inbound($business, 'expired finalization', sender: 'expired');
         $this->claimFinalization($business, 'expired', 60);
-        $this->inbound($business, 'active finalization', sender: 'active');
+        $active = $this->inbound($business, 'active finalization', sender: 'active');
         $this->claimFinalization($business, 'active', 120);
-        $this->inbound($business, 'finalization backoff', sender: 'backoff');
+        $backoff = $this->inbound($business, 'finalization backoff', sender: 'backoff');
         $turns->fail($business, $this->claimFinalization($business, 'backoff', 60));
         $terminal = $this->inbound($business, 'closed without reply', sender: 'closed');
         $turns->terminate($business, $this->claimFinalization($business, 'closed', 60));
@@ -155,16 +155,19 @@ class ConversationReconciliationTest extends TestCase
 
         foreach ([$lastAttempt->refresh(), $pending->refresh(), $expired->refresh()] as $turn) {
             $this->assertSame(1, $turn->attempt_count);
-            $this->assertSame(AiTurnState::FailureResolutionPending, $turn->state);
-            $this->assertNull($turn->assistant_message_id);
+            $this->assertSame(AiTurnState::Completed, $turn->state);
+            $this->assertNotNull($turn->assistant_message_id);
+            $this->assertTrue($turn->fallback_used);
         }
+        $this->assertSame(AiTurnState::ResolvingFailure, $active->fresh()->state);
+        $this->assertSame(AiTurnState::FailureResolutionPending, $backoff->fresh()->state);
         $this->assertSame(AiTurnState::ClosedWithoutResponse, $terminal->fresh()->state);
         $this->assertSame('Answer after closure', $afterTerminal->fresh()->assistantMessage->content);
         ConversationAgent::assertPromptedTimes(1);
 
         Queue::fake([ProcessConversationTurn::class]);
         $this->tick();
-        $this->assertQueuedConversations([$lastAttempt, $pending, $expired]);
+        $this->assertQueuedConversations([$backlog]);
     }
 
     public function test_scheduler_skips_reconciliation_while_another_scan_holds_the_lock(): void
@@ -211,6 +214,10 @@ class ConversationReconciliationTest extends TestCase
         $this->assertQueuedConversations([$exhausted, $pending, $exhausted]);
         $this->assertSame(AiTurnState::FailureResolutionPending, $exhausted->fresh()->state);
         $this->assertSame('Answer', $pending->fresh()->assistantMessage->content);
+
+        Queue::pushed(ProcessConversationTurn::class)->last()->handle(app(ConversationTurnProcessor::class));
+        $this->assertSame(AiTurnState::Completed, $exhausted->refresh()->state);
+        $this->assertTrue($exhausted->fallback_used);
         ConversationAgent::assertPromptedTimes(1);
     }
 

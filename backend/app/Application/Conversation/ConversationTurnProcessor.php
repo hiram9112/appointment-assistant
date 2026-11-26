@@ -22,13 +22,14 @@ final class ConversationTurnProcessor
         private AppointmentProposals $proposals,
         private ConfirmAppointmentProposal $confirmations,
         private ResolveCustomer $customers,
+        private EmergencyConversationResponse $emergencyResponse,
     ) {}
 
     /** Process or resume one participant's next turn; identities come from trusted application code. */
     public function processNext(
         Business $business, string $channel, string $senderIdentity, int $leaseSeconds = 300, ?int $expectedConversationId = null,
     ): ConversationMessage|AiTurnOutcome {
-        return $this->turns->processNext($business, $channel, $senderIdentity, function (AiTurnClaim $claim) use ($business): string {
+        $result = $this->turns->processNext($business, $channel, $senderIdentity, function (AiTurnClaim $claim) use ($business): string {
             $executionContext = $this->executionContext($business, $claim);
             if ($executionContext instanceof AiTurnOutcome) {
                 throw new LogicException('The claimed turn is no longer authorized.');
@@ -61,6 +62,26 @@ final class ConversationTurnProcessor
             )->withMessages($this->history->completedTurns($completed))
                 ->prompt($claim->inboundMessage->content)->text;
         }, $leaseSeconds, $expectedConversationId);
+
+        if ($result !== AiTurnOutcome::FailureResolutionPending) {
+            return $result;
+        }
+
+        $claim = $this->turns->claimFinalizationNext($business, $channel, $senderIdentity, $leaseSeconds, $expectedConversationId);
+        if ($claim instanceof AiTurnOutcome) {
+            return $claim;
+        }
+
+        return $this->turns->finalize($business, $claim, function (AiTurn $turn, Conversation $conversation) use ($business): string {
+            if ($conversation->customer_id === null) {
+                // A crash before normal context loading can leave the first turn unassociated.
+                $this->customerContext($business, $turn, $conversation);
+
+                return $this->emergencyResponse->build(null);
+            }
+
+            return $this->emergencyResponse->build($this->confirmations->recoverForTurn($turn, $conversation));
+        });
     }
 
     /**
@@ -71,35 +92,15 @@ final class ConversationTurnProcessor
     private function executionContext(Business $business, AiTurnClaim $claim): array|AiTurnOutcome
     {
         return $this->turns->withOwnership($business, $claim, function (AiTurn $turn, Conversation $conversation) use ($business, $claim): array {
-            $context = ['customer' => ['status' => 'unregistered'], 'active_proposal' => null];
-            try {
-                $customer = $this->customers->handle($conversation->channel, $conversation->sender_identity);
-            } catch (ValidationException) {
-                if ($conversation->customer_id !== null || AppointmentProposal::query()->where('conversation_id', $conversation->id)->exists()) {
-                    throw new LogicException('Customer identity could not be verified for the Conversation.');
-                }
-
-                return [...$context, 'customer' => ['status' => 'unsupported_channel']];
+            $customer = $this->customerContext($business, $turn, $conversation);
+            if (isset($customer['error'])) {
+                throw new LogicException($customer['error']);
             }
-            if (($conversation->customer_id !== null && $conversation->customer_id !== $customer?->id)
-                || ($conversation->customer_id === null && AppointmentProposal::query()->where('conversation_id', $conversation->id)->exists())) {
-                throw new LogicException('Customer identity could not be verified for the Conversation.');
-            }
-            if ($customer === null) {
+            $context = ['customer' => $customer, 'active_proposal' => null];
+            if ($customer['status'] !== 'identified') {
                 return $context;
             }
-            if ($conversation->customer_id === null) {
-                $completed = $this->turns->completedBefore($business, $turn->inbound_message_id);
-                if ($completed instanceof AiTurnOutcome || $completed->isNotEmpty()) {
-                    throw new LogicException('Customer identity could not be verified for the Conversation history.');
-                }
-                $conversation->customer()->associate($customer);
-                $conversation->save();
-            }
-            $context['customer'] = [
-                'status' => 'identified', 'id' => $customer->id,
-                'first_name' => $customer->first_name, 'last_name' => $customer->last_name,
-            ];
+
             $active = $this->proposals->active($business, $claim);
             if ($active instanceof AppointmentProposal) {
                 $context['active_proposal'] = [
@@ -119,5 +120,39 @@ final class ConversationTurnProcessor
 
             return $context;
         });
+    }
+
+    /** @return array{status: string, id?: int, first_name?: string, last_name?: string, error?: string} */
+    private function customerContext(Business $business, AiTurn $turn, Conversation $conversation): array
+    {
+        $hasProposal = $conversation->customer_id === null && AppointmentProposal::query()->where('conversation_id', $conversation->id)->exists();
+        $identityFailure = ['status' => 'identification_failed', 'error' => 'Customer identity could not be verified for the Conversation.'];
+        try {
+            $customer = $this->customers->handle($conversation->channel, $conversation->sender_identity);
+        } catch (ValidationException) {
+            return $conversation->customer_id !== null || $hasProposal ? $identityFailure : ['status' => 'unsupported_channel'];
+        }
+
+        if (($conversation->customer_id !== null && $conversation->customer_id !== $customer?->id) || $hasProposal) {
+            return $identityFailure;
+        }
+        if ($customer === null) {
+            return ['status' => 'unregistered'];
+        }
+        if ($conversation->customer_id === null) {
+            $completed = $this->turns->completedBefore($business, $turn->inbound_message_id);
+            if ($completed instanceof AiTurnOutcome || $completed->isNotEmpty()) {
+                return ['status' => 'identification_failed', 'error' => 'Customer identity could not be verified for the Conversation history.'];
+            }
+            $conversation->customer()->associate($customer);
+            if (! $conversation->save()) {
+                throw new LogicException('The verified Customer could not be associated with the Conversation.');
+            }
+        }
+
+        return [
+            'status' => 'identified', 'id' => $customer->id,
+            'first_name' => $customer->first_name, 'last_name' => $customer->last_name,
+        ];
     }
 }

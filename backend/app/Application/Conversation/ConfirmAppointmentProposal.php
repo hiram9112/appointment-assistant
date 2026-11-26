@@ -115,11 +115,19 @@ final class ConfirmAppointmentProposal
      */
     public function recover(Business $business, AiTurnClaim $claim): array|AiTurnOutcome|null
     {
-        return $this->turns->withOwnership($business, $claim, function (AiTurn $turn, Conversation $conversation): ?array {
-            $customer = $this->customer($conversation);
+        return $this->turns->withOwnership($business, $claim, $this->recoverForTurn(...));
+    }
 
-            return $customer === null ? null : $this->resultForTurn($conversation, $turn, $customer);
-        });
+    /**
+     * Read only the exact outcome while the caller holds current turn ownership.
+     *
+     * @return array<string, mixed>|null
+     */
+    public function recoverForTurn(AiTurn $turn, Conversation $conversation): ?array
+    {
+        $customer = $this->customer($conversation);
+
+        return $customer === null ? null : $this->resultForTurn($conversation, $turn, $customer);
     }
 
     /** A missing association is never ownership proof for an existing proposal. */
@@ -142,8 +150,10 @@ final class ConfirmAppointmentProposal
         $proposal = AppointmentProposal::query()->where('conversation_id', $conversation->id)
             ->where('confirming_turn_id', $turn->id)->lockForUpdate()->first();
 
-        return $proposal !== null && ($proposal->result['customer_id'] ?? null) === $customer->id
-            ? $proposal->result : null;
+        $result = $proposal?->result;
+
+        return ($result['business_id'] ?? null) === $conversation->business_id
+            && ($result['customer_id'] ?? null) === $customer->id ? $result : null;
     }
 
     /** @param array<string, mixed> $result

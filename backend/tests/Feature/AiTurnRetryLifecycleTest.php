@@ -112,12 +112,17 @@ class AiTurnRetryLifecycleTest extends TestCase
             }
         }
         $this->assertSame(AiTurnState::FailureResolutionPending, $turn->fresh()->state);
-        $this->assertSame(AiTurnOutcome::FailureResolutionPending, $processor->processNext($this->business, 'web', 'sender'));
-        $this->travel(1)->hours();
         $this->assertSame(AiTurnOutcome::FailureResolutionPending, $this->claim());
-        $this->assertSame(3, $turn->fresh()->attempt_count);
-        $this->assertCount(3, $turn->fresh()->diagnostics['attempts']);
         $this->assertNull($turn->fresh()->assistant_message_id);
+
+        $response = $processor->processNext($this->business, 'web', 'sender');
+        $this->assertInstanceOf(ConversationMessage::class, $response);
+        $this->assertSame($response->id, $turn->refresh()->assistant_message_id);
+        $this->assertTrue($turn->fallback_used);
+        $this->assertSame(3, $turn->attempt_count);
+        $this->assertCount(3, $turn->diagnostics['attempts']);
+        $this->travel(1)->hours();
+        $this->assertSame(AiTurnOutcome::Idle, $this->claim());
         ConversationAgent::assertPromptedTimes(3);
     }
 

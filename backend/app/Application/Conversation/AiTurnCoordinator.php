@@ -18,6 +18,7 @@ use Illuminate\Support\Str;
 use InvalidArgumentException;
 use Laravel\Ai\Exceptions\InsufficientCreditsException;
 use LogicException;
+use PDOException;
 use Throwable;
 
 final class AiTurnCoordinator
@@ -59,9 +60,10 @@ final class AiTurnCoordinator
     }
 
     /** Finalization can accept a response or terminate work, but cannot authorize AI tools. */
-    public function claimFinalizationNext(Business $business, string $channel, string $senderIdentity, int $leaseSeconds = 300): AiTurnClaim|AiTurnOutcome
-    {
-        return $this->claim($business, $channel, $senderIdentity, $leaseSeconds, true);
+    public function claimFinalizationNext(
+        Business $business, string $channel, string $senderIdentity, int $leaseSeconds = 300, ?int $expectedConversationId = null,
+    ): AiTurnClaim|AiTurnOutcome {
+        return $this->claim($business, $channel, $senderIdentity, $leaseSeconds, true, $expectedConversationId);
     }
 
     private function claim(
@@ -156,30 +158,61 @@ final class AiTurnCoordinator
      */
     public function complete(Business $business, AiTurnClaim $claim, string $content): ConversationMessage|AiTurnOutcome
     {
-        return $this->withClaimOwnership($business, $claim, function (AiTurn $turn, Conversation $conversation) use ($business, $content): ConversationMessage {
-            $fallback = $turn->state === AiTurnState::ResolvingFailure;
-            $proposal = AppointmentProposal::query()->where('conversation_id', $conversation->id)
-                ->where('originating_turn_id', $turn->id)->lockForUpdate()->first();
-            $message = $this->conversations->assistant($business, $conversation->id, $content);
-            if (! $message instanceof ConversationMessage) {
-                throw new LogicException('The claimed Conversation disappeared during completion.');
-            }
-            $turn->update([
-                'state' => AiTurnState::Completed, 'assistant_message_id' => $message->id,
-                'completed_at' => now(), 'claim_token' => null, 'claimed_until' => null,
-                'next_attempt_at' => null, 'fallback_used' => $fallback,
-            ]);
-            if ($fallback) {
-                $this->abandonProposals($conversation);
-            } elseif ($proposal?->state === AppointmentProposalState::Prepared) {
-                $proposal->update([
-                    'state' => AppointmentProposalState::Pending,
-                    'confirmation_request_message_id' => $message->id,
-                ]);
-            }
+        return $this->withClaimOwnership(
+            $business, $claim, fn (AiTurn $turn, Conversation $conversation): ConversationMessage => $this->acceptResponse($business, $turn, $conversation, $content),
+            true,
+        );
+    }
 
-            return $message;
-        }, true);
+    /**
+     * Read the result and accept deterministic text under the same finalization claim.
+     *
+     * @param  Closure(AiTurn, Conversation): string  $buildResponse
+     */
+    public function finalize(Business $business, AiTurnClaim $claim, Closure $buildResponse): ConversationMessage|AiTurnOutcome
+    {
+        try {
+            return $this->withClaimOwnership($business, $claim, function (AiTurn $turn, Conversation $conversation) use ($business, $buildResponse): ConversationMessage|AiTurnOutcome {
+                if ($turn->state !== AiTurnState::ResolvingFailure) {
+                    return AiTurnOutcome::NotEligible;
+                }
+
+                return $this->acceptResponse($business, $turn, $conversation, $buildResponse($turn, $conversation));
+            }, true);
+        } catch (Throwable $exception) {
+            $this->fail($business, $claim, $exception instanceof PDOException ? AiTurnFailure::PersistenceUnavailable : AiTurnFailure::Recoverable,
+                AiTurnFailureReason::FinalizationFailed, $exception);
+
+            throw $exception;
+        }
+    }
+
+    private function acceptResponse(Business $business, AiTurn $turn, Conversation $conversation, string $content): ConversationMessage
+    {
+        $fallback = $turn->state === AiTurnState::ResolvingFailure;
+        $proposal = AppointmentProposal::query()->where('conversation_id', $conversation->id)
+            ->where('originating_turn_id', $turn->id)->lockForUpdate()->first();
+        $message = $this->conversations->assistant($business, $conversation->id, $content);
+        if (! $message instanceof ConversationMessage || ! $message->exists) {
+            throw new LogicException('The assistant message could not be persisted.');
+        }
+        if (! $turn->update([
+            'state' => AiTurnState::Completed, 'assistant_message_id' => $message->id,
+            'completed_at' => now(), 'claim_token' => null, 'claimed_until' => null,
+            'next_attempt_at' => null, 'fallback_used' => $fallback,
+        ])) {
+            throw new LogicException('The assistant response could not be accepted.');
+        }
+        if ($fallback) {
+            $this->abandonProposals($conversation);
+        } elseif ($proposal?->state === AppointmentProposalState::Prepared) {
+            $proposal->update([
+                'state' => AppointmentProposalState::Pending,
+                'confirmation_request_message_id' => $message->id,
+            ]);
+        }
+
+        return $message;
     }
 
     public function fail(
@@ -219,10 +252,12 @@ final class AiTurnCoordinator
                 return AiTurnOutcome::NotEligible;
             }
             $this->abandonProposals($conversation);
-            $turn->update([
+            if (! $turn->update([
                 'state' => AiTurnState::ClosedWithoutResponse, 'terminal_at' => now(), 'terminal_reason' => $reason,
                 'claim_token' => null, 'claimed_until' => null, 'next_attempt_at' => null,
-            ]);
+            ])) {
+                throw new LogicException('The terminal disposition could not be persisted.');
+            }
 
             return $turn;
         }, true);
@@ -341,7 +376,9 @@ final class AiTurnCoordinator
         $proposals = AppointmentProposal::query()->where('conversation_id', $conversation->id)
             ->whereIn('state', [AppointmentProposalState::Prepared, AppointmentProposalState::Pending])->lockForUpdate()->get();
         foreach ($proposals as $proposal) {
-            $proposal->update(['state' => AppointmentProposalState::Rejected]);
+            if (! $proposal->update(['state' => AppointmentProposalState::Rejected])) {
+                throw new LogicException('The abandoned proposal could not be invalidated.');
+            }
         }
     }
 

@@ -4,6 +4,8 @@ namespace Tests\Feature;
 
 use App\Application\Conversation\AiTurnClaim;
 use App\Application\Conversation\AiTurnCoordinator;
+use App\Application\Conversation\AiTurnFailure;
+use App\Application\Conversation\AiTurnFailureReason;
 use App\Application\Conversation\AiTurnOutcome;
 use App\Application\Conversation\AiTurnState;
 use App\Application\Conversation\AppointmentProposalOperation;
@@ -311,6 +313,43 @@ class AiTurnConcurrencyTest extends TestCase
         $this->assertSame('message', $this->finish($first)['kind']);
         $this->assertSame(['kind' => 'outcome', 'name' => 'StaleAttempt'], $this->finish($second));
         $this->assertDatabaseCount('conversation_messages', 2);
+    }
+
+    #[DataProvider('responseOrder')]
+    public function test_late_normal_response_and_fallback_race_to_accept_only_one_reply(bool $fallbackFirst): void
+    {
+        config(['conversation.processing.max_attempts' => 1]);
+        $coordinator = app(AiTurnCoordinator::class);
+        $turn = $coordinator->inbound($this->business, 'web', 'sender', '1', 'hello');
+        $claim = $coordinator->claimNext($this->business, 'web', 'sender');
+        $time = '2030-01-01 12:05:00 UTC';
+        $normal = $this->claimData($claim);
+        $fallback = ['conversation' => $turn->inboundMessage->conversation_id, 'max_attempts' => 1];
+        $first = $this->start($fallbackFirst ? 'queued_process' : 'complete', $fallbackFirst ? $fallback : $normal, 'insert', $time);
+        $this->assertSame("locked\n", $this->line($first));
+        $second = $this->start($fallbackFirst ? 'complete' : 'queued_process', $fallbackFirst ? $normal : $fallback, time: $time);
+        $this->assertBlocked($first, $second);
+        $this->release($first);
+        $firstResult = $this->finish($first);
+        $secondResult = $this->finish($second);
+
+        $this->assertSame('job', ($fallbackFirst ? $firstResult : $secondResult)['kind']);
+        if ($fallbackFirst) {
+            $this->assertSame(['kind' => 'outcome', 'name' => 'StaleAttempt'], $secondResult);
+            $this->assertStringContainsString('No pudimos completar tu solicitud', $turn->fresh()->assistantMessage->content);
+        } else {
+            $this->assertSame('message', $firstResult['kind']);
+            $this->assertSame('answer', $turn->fresh()->assistantMessage->content);
+        }
+        $this->assertSame(AiTurnState::Completed, $turn->refresh()->state);
+        $this->assertSame($fallbackFirst, $turn->fallback_used);
+        $this->assertSame(1, $turn->attempt_count);
+        $this->assertDatabaseCount('conversation_messages', 2);
+    }
+
+    public static function responseOrder(): array
+    {
+        return ['normal response first' => [false], 'fallback first' => [true]];
     }
 
     #[DataProvider('replacementOrder')]
@@ -729,6 +768,48 @@ class AiTurnConcurrencyTest extends TestCase
         ConversationAgent::assertPromptedTimes(1);
     }
 
+    public function test_scheduler_recovers_a_worker_killed_during_atomic_fallback_acceptance(): void
+    {
+        [$claim, $proposal, $appointment] = $this->confirmation();
+        $stored = app(ConfirmAppointmentProposal::class)->handle($this->business, $claim, true);
+        $this->assertSame('cancelled', $stored['outcome']);
+        $turn = app(AiTurnCoordinator::class)->fail($this->business, $claim, AiTurnFailure::NonRecoverable, AiTurnFailureReason::GenerationFailed);
+        $worker = $this->start('queued_process', ['conversation' => $claim->inboundMessage->conversation_id], 'after_insert', now()->toAtomString());
+        $this->assertSame("locked\n", $this->line($worker));
+        $this->assertSame(AiTurnState::ResolvingFailure, $turn->refresh()->state);
+        $this->assertDatabaseCount('conversation_messages', 3);
+
+        ['process' => $process, 'pipes' => $pipes] = $this->workers[$worker];
+        $this->assertTrue(proc_terminate($process, 9));
+        foreach ($pipes as $pipe) {
+            fclose($pipe);
+        }
+        proc_close($process);
+        unset($this->workers[$worker]);
+
+        Queue::fake([ProcessConversationTurn::class]);
+        ConversationAgent::fake([])->preventStrayPrompts();
+        $this->travelTo($turn->claimed_until);
+        $this->artisan('schedule:run')->assertSuccessful();
+        $job = Queue::pushed(ProcessConversationTurn::class)->sole();
+        $processor = app(ConversationTurnProcessor::class);
+        $job->handle($processor);
+        $job->handle($processor);
+
+        $this->assertSame(AiTurnState::Completed, $turn->refresh()->state);
+        $this->assertTrue($turn->fallback_used);
+        $this->assertSame(1, $turn->attempt_count);
+        $this->assertSame(2, $turn->diagnostics['finalization']['claim_count']);
+        $this->assertSame(AiTurnFailureReason::GenerationFailed, $turn->failure_reason);
+        $this->assertSame(AiTurnFailureReason::ClaimExpired->value, $turn->diagnostics['finalization']['last_failure']['reason']);
+        $this->assertStringContainsString('Tu cita ha sido cancelada.', $turn->assistantMessage->content);
+        $this->assertSame('cancelled', $appointment->fresh()->status);
+        $this->assertSame($stored, $proposal->fresh()->result);
+        $this->assertDatabaseCount('conversation_messages', 4);
+        $this->assertDatabaseCount('appointment_audits', 1);
+        ConversationAgent::assertNeverPrompted();
+    }
+
     public function test_conversation_replacement_fences_a_waiting_confirmation(): void
     {
         [$claim, $proposal, $appointment] = $this->confirmation();
@@ -847,6 +928,9 @@ class AiTurnConcurrencyTest extends TestCase
             if ($barrier === 'insert') {
                 App\Models\ConversationMessage::creating(fn () => $wait('locked'));
             }
+            if ($barrier === 'after_insert') {
+                App\Models\ConversationMessage::created(fn () => $wait('locked'));
+            }
             if ($barrier === 'claim') {
                 App\Models\AiTurn::updating(fn () => $wait('locked'));
             }
@@ -867,6 +951,9 @@ class AiTurnConcurrencyTest extends TestCase
                 $business = App\Models\Business::findOrFail($data['business'] ?? $argv[1]);
                 $sender = $data['sender'] ?? 'sender';
                 $coordinator = app(App\Application\Conversation\AiTurnCoordinator::class);
+                if (isset($data['max_attempts'])) {
+                    config(['conversation.processing.max_attempts' => $data['max_attempts']]);
+                }
                 if ($data['serializable'] ?? false) {
                     Illuminate\Support\Facades\DB::statement('SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE');
                 }
