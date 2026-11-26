@@ -37,7 +37,7 @@ This project has domain-specific skills available in `**/skills/**`. You MUST ac
 ## Documentation Files
 
 - You must only create documentation files if explicitly requested by the user.
-- Update `.env.example` when adding or renaming a project-specific environment variable in `config/`. Laravel's built-in variables do not require exhaustive documentation.
+- When introducing or modifying environment variables in project-specific configuration files, keep `.env.example` synchronized with their non-sensitive fallback values. These variables must be uncommented and assigned their corresponding default values. This rule does not apply to Laravel's built-in configuration files, even if the project has modified them.
 
 === boost rules ===
 

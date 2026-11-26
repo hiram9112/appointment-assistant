@@ -90,8 +90,7 @@ final class AiTurnCoordinator
 
             $turns = AiTurn::query()->whereHas('inboundMessage', fn (Builder $query) => $query
                 ->whereIn('conversation_id', (clone $conversations)->select('id')))
-                ->whereIn('state', [AiTurnState::Pending, AiTurnState::Processing, AiTurnState::Failed,
-                    AiTurnState::FailureResolutionPending, AiTurnState::ResolvingFailure]);
+                ->whereIn('state', AiTurnState::unfinished());
 
             (clone $turns)->whereHas('inboundMessage', fn (Builder $query) => $query->where('conversation_id', '!=', $current->id))
                 ->update(['state' => AiTurnState::Superseded, 'claim_token' => null, 'claimed_until' => null, 'next_attempt_at' => null]);
@@ -108,10 +107,10 @@ final class AiTurnCoordinator
             }
 
             $exhausted = in_array($turn->state, [AiTurnState::FailureResolutionPending, AiTurnState::ResolvingFailure], true)
-                || $turn->attempt_count >= max(1, (int) config('conversation.processing.max_attempts'));
+                || $turn->attempt_count >= AiTurnRetryPolicy::maxAttempts();
             if ($turn->state === AiTurnState::Processing && ! $exhausted) {
                 $claimedAt = $turn->diagnostics['attempts'][$turn->attempt_count]['claimed_at'] ?? $turn->updated_at;
-                if (CarbonImmutable::parse($claimedAt)->addSeconds($this->retryDelay($turn->attempt_count))->isFuture()) {
+                if (CarbonImmutable::parse($claimedAt)->addSeconds(AiTurnRetryPolicy::delay($turn->attempt_count))->isFuture()) {
                     return AiTurnOutcome::NotDue;
                 }
             }
@@ -200,10 +199,10 @@ final class AiTurnCoordinator
             } else {
                 $this->recordFailure($turn, $classification, $reason, $exception);
                 $exhausted = $classification === AiTurnFailure::NonRecoverable
-                    || $turn->attempt_count >= max(1, (int) config('conversation.processing.max_attempts'));
+                    || $turn->attempt_count >= AiTurnRetryPolicy::maxAttempts();
                 $turn->fill([
                     'state' => $exhausted ? AiTurnState::FailureResolutionPending : AiTurnState::Failed,
-                    'next_attempt_at' => $exhausted ? null : now()->addSeconds($this->retryDelay($turn->attempt_count)),
+                    'next_attempt_at' => $exhausted ? null : now()->addSeconds(AiTurnRetryPolicy::delay($turn->attempt_count)),
                 ]);
             }
             $turn->fill(['claim_token' => null, 'claimed_until' => null])->save();
@@ -255,18 +254,6 @@ final class AiTurnCoordinator
 
             throw $exception;
         }
-    }
-
-    /** Invalid configuration must not prevent recording the original processing failure. */
-    private function retryDelay(int $attempt): int
-    {
-        $delays = config('conversation.processing.retry_delays_seconds');
-        if (! is_array($delays) || $delays === [] || ! array_is_list($delays)
-            || array_filter($delays, fn (mixed $delay): bool => ! is_int($delay) || $delay < 1) !== []) {
-            $delays = [30, 120];
-        }
-
-        return $delays[min(max(0, $attempt - 1), count($delays) - 1)];
     }
 
     /** @return Collection<int, AiTurn>|AiTurnOutcome Completed pairs, not raw message insertion order. */

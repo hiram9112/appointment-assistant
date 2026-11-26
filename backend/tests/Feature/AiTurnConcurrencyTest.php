@@ -11,7 +11,11 @@ use App\Application\Conversation\AppointmentProposalPayload;
 use App\Application\Conversation\AppointmentProposalPresentation;
 use App\Application\Conversation\AppointmentProposals;
 use App\Application\Conversation\AppointmentProposalState;
+use App\Application\Conversation\ConfirmAppointmentProposal;
+use App\Application\Conversation\ConversationAgent;
+use App\Application\Conversation\ConversationTurnProcessor;
 use App\Application\Conversation\PrepareAppointmentProposal;
+use App\Jobs\ProcessConversationTurn;
 use App\Models\AiTurn;
 use App\Models\Appointment;
 use App\Models\AppointmentProposal;
@@ -26,6 +30,7 @@ use Carbon\CarbonImmutable;
 use Illuminate\Foundation\Testing\DatabaseMigrations;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Queue;
 use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\TestCase;
 
@@ -662,6 +667,68 @@ class AiTurnConcurrencyTest extends TestCase
         $this->assertDatabaseCount('appointment_audits', 1);
     }
 
+    public function test_scheduler_recovers_a_terminated_worker_without_repeating_its_committed_cancellation(): void
+    {
+        [$claim, $proposal, $appointment] = $this->confirmation();
+        $turns = app(AiTurnCoordinator::class);
+        $failed = $turns->fail($this->business, $claim);
+        $this->travelTo($failed->next_attempt_at);
+        $worker = $this->start('queued_process', [
+            'conversation' => $claim->inboundMessage->conversation_id,
+            'cancel_turn' => $claim->turnId,
+        ], 'generate', now()->toAtomString());
+        $this->assertSame("generating\n", $this->line($worker));
+        $stored = $proposal->fresh()->result;
+        $this->assertSame('cancelled', $stored['outcome']);
+
+        ['process' => $process, 'pipes' => $pipes] = $this->workers[$worker];
+        $this->assertTrue(proc_terminate($process, 9));
+        foreach ($pipes as $pipe) {
+            fclose($pipe);
+        }
+        proc_close($process);
+        unset($this->workers[$worker]);
+        $interrupted = AiTurn::findOrFail($claim->turnId);
+        $this->assertSame(AiTurnState::Processing, $interrupted->state);
+        $this->assertSame(2, $interrupted->attempt_count);
+        $this->assertNull($interrupted->assistant_message_id);
+
+        Queue::fake([ProcessConversationTurn::class]);
+        $this->travelTo($interrupted->claimed_until->copy()->subSecond());
+        $this->artisan('schedule:run')->assertSuccessful();
+        Queue::assertNothingPushed();
+        $this->travel(1)->second();
+        $this->artisan('schedule:run')->assertSuccessful();
+        $this->travel(1)->minute();
+        $this->artisan('schedule:run')->assertSuccessful();
+        Queue::assertPushedTimes(ProcessConversationTurn::class, 2);
+        [$first, $duplicate] = Queue::pushed(ProcessConversationTurn::class)->all();
+        $processor = app(ConversationTurnProcessor::class);
+        ConversationAgent::fake(function () use ($interrupted, $stored, $duplicate): string {
+            $current = $interrupted->fresh();
+            $competitor = $this->start('queued_process', ['conversation' => $duplicate->conversationId], time: now()->toAtomString());
+            $this->assertSame(['kind' => 'job'], $this->finish($competitor));
+            $this->assertSame($current->claim_token, $interrupted->fresh()->claim_token);
+            $retry = new AiTurnClaim($current->id, $current->claim_token, $current->inboundMessage);
+            $this->assertSame($stored, app(ConfirmAppointmentProposal::class)->handle($this->business, $retry, true));
+
+            return 'Tu cita fue cancelada.';
+        })->preventStrayPrompts();
+
+        $first->handle($processor);
+        $duplicate->handle($processor);
+
+        $this->assertSame(AiTurnState::Completed, $interrupted->refresh()->state);
+        $this->assertSame(3, $interrupted->attempt_count);
+        $this->assertSame('Tu cita fue cancelada.', $interrupted->assistantMessage->content);
+        $this->assertDatabaseCount('conversation_messages', 4);
+        $this->assertSame('cancelled', $appointment->fresh()->status);
+        $this->assertDatabaseCount('appointments', 1);
+        $this->assertDatabaseCount('appointment_audits', 1);
+        $this->assertSame($stored, $proposal->fresh()->result);
+        ConversationAgent::assertPromptedTimes(1);
+    }
+
     public function test_conversation_replacement_fences_a_waiting_confirmation(): void
     {
         [$claim, $proposal, $appointment] = $this->confirmation();
@@ -810,11 +877,17 @@ class AiTurnConcurrencyTest extends TestCase
                         Illuminate\Support\Facades\DB::select('select pg_advisory_xact_lock(?)', [$data['locks'][1]]);
                     });
                 }
-                if ($argv[2] === 'sdk_process') {
+                if (in_array($argv[2], ['sdk_process', 'queued_process'], true)) {
                     config(['ai.default' => 'openai', 'ai.providers.openai.models.text.default' => 'test-model']);
                     $app->bind(Laravel\Ai\Contracts\ConversationStore::class, fn () => throw new RuntimeException('Unexpected SDK storage'));
-                    App\Application\Conversation\ConversationAgent::fake(function () use ($barrier, $wait): string {
+                    App\Application\Conversation\ConversationAgent::fake(function () use ($barrier, $wait, $business, $data): string {
                         if (Illuminate\Support\Facades\DB::transactionLevel() !== 0) { throw new RuntimeException('Open provider transaction'); }
+                        if (isset($data['cancel_turn'])) {
+                            $turn = App\Models\AiTurn::findOrFail($data['cancel_turn']);
+                            $claim = new App\Application\Conversation\AiTurnClaim($turn->id, $turn->claim_token, $turn->inboundMessage);
+                            $result = app(App\Application\Conversation\ConfirmAppointmentProposal::class)->handle($business, $claim, true);
+                            if ($result['outcome'] !== 'cancelled') { throw new RuntimeException('Cancellation did not commit'); }
+                        }
                         if ($barrier === 'generate') { $wait('generating'); }
                         return 'answer';
                     })->preventStrayPrompts();
@@ -895,6 +968,13 @@ class AiTurnConcurrencyTest extends TestCase
                         return 'answer';
                     }),
                     'sdk_process' => app(App\Application\Conversation\ConversationTurnProcessor::class)->processNext($business, 'web', $sender),
+                    'queued_process' => (function () use ($data): array {
+                        (new App\Jobs\ProcessConversationTurn($data['conversation']))->handle(
+                            app(App\Application\Conversation\ConversationTurnProcessor::class),
+                        );
+                        App\Application\Conversation\ConversationAgent::assertNeverPrompted();
+                        return ['kind' => 'job'];
+                    })(),
                 };
                 if ($argv[2] === 'sdk_process') {
                     if ($result instanceof App\Models\ConversationMessage) {

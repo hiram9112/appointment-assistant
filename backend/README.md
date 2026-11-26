@@ -107,8 +107,23 @@ The AI SDK allows up to 60 seconds per provider request. The Job caps the entire
 turn (which may make multiple requests) at 240 seconds, below the default
 270-second Redis reservation and 300-second PostgreSQL claim lease. Keep
 `REDIS_QUEUE_RETRY_AFTER` above the Job timeout. The worker does not retry a Job
-on failure; PostgreSQL retains the turn for later recovery. Scheduled recovery
-is not wired up yet.
+on failure; PostgreSQL retains the turn for scheduled recovery.
+
+Run Laravel Scheduler from `backend/` in another terminal:
+
+```bash
+php artisan schedule:work
+```
+
+Every minute, `conversation:reconcile` checks PostgreSQL and requeues up to
+100 eligible Conversations (`CONVERSATION_RECONCILIATION_BATCH_SIZE`).
+Keep `CACHE_STORE=redis` so scheduler processes share the overlap lock and
+the temporary scan cursor. Each scan cycle covers a fixed range of inbound IDs
+so new arrivals cannot delay a return to older work indefinitely. Losing the
+cursor restarts the scan in PostgreSQL.
+Use `php artisan schedule:run` to run one scheduler tick locally.
+Exhausted turns remain discoverable without another AI attempt; deterministic
+finalization is not yet implemented.
 
 ## Tests
 

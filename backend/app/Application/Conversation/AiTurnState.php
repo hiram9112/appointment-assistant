@@ -12,4 +12,10 @@ enum AiTurnState: string
     case ResolvingFailure = 'resolving_failure';
     case ClosedWithoutResponse = 'closed_without_response';
     case Superseded = 'superseded';
+
+    /** @return list<self> */
+    public static function unfinished(): array
+    {
+        return [self::Pending, self::Processing, self::Failed, self::FailureResolutionPending, self::ResolvingFailure];
+    }
 }
