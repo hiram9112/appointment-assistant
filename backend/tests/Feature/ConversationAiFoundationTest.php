@@ -2,6 +2,8 @@
 
 namespace Tests\Feature;
 
+use App\Application\Conversation\BusinessContextBuilder;
+use App\Application\Conversation\CheckAvailabilityTool;
 use App\Application\Conversation\ConversationAgent;
 use App\Application\Conversation\ConversationHandler;
 use App\Application\Conversation\ConversationHistoryAdapter;
@@ -32,7 +34,10 @@ class ConversationAiFoundationTest extends TestCase
         $this->app->bind(ConversationStore::class, fn () => throw new RuntimeException('SDK conversation store must not be used.'));
         ConversationAgent::fake(['A fake answer']);
 
-        $response = ConversationAgent::make()->withMessages($history)->prompt($current->content);
+        $response = ConversationAgent::make(
+            runtimeContext: app(BusinessContextBuilder::class)->handle($business),
+            availabilityTool: app()->makeWith(CheckAvailabilityTool::class, ['business' => $business]),
+        )->withMessages($history)->prompt($current->content);
 
         $this->assertSame('A fake answer', $response->text);
         ConversationAgent::assertPromptedTimes(1);

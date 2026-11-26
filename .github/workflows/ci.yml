@@ -57,7 +57,6 @@ jobs:
       REDIS_PASSWORD: null
 
       CACHE_STORE: array
-      QUEUE_CONNECTION: sync
       SESSION_DRIVER: array
 
     steps:

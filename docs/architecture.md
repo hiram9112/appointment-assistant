@@ -185,7 +185,14 @@ Laravel application capability
 The AI layer interprets natural-language requests and selects appropriate
 application capabilities.
 
-AI tools delegate operations to Laravel.
+Laravel capabilities supply current, customer-facing Business, Service and
+Professional information as temporary runtime context, separate from stable
+instructions. Business-provided text is untrusted data, not instructions.
+
+AI tools delegate authoritative operations, including Appointment availability,
+to Laravel. Laravel validates model-generated references against current,
+Business-scoped data. Descriptive operating hours do not establish valid
+Appointment starts.
 
 They do not independently implement scheduling rules or directly modify
 Appointment persistence.

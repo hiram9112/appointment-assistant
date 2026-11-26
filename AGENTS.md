@@ -168,6 +168,8 @@ Read-only Git inspection is allowed when useful, including:
 
 The Developer reviews and commits all changes.
 
+**Exception — Merged branch cleanup:** When explicitly requested by the developer, the agent may switch to `main`, update it using fast-forward only, and delete a merged branch using `git branch -d`, including its remote branch. Before deletion, verify that the working tree is clean (including untracked files) and that the branch is fully merged into `main`. Abort if any check fails. Never use `git branch -D` or force deletion.
+
 ---
 
 ## 8. Completion report

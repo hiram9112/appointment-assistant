@@ -20,7 +20,7 @@
     <php>
         <env name="APP_ENV" value="testing"/>     
         <env name="CACHE_STORE" value="array"/>                          
-        <env name="QUEUE_CONNECTION" value="sync"/>
+        <env name="QUEUE_CONNECTION" value="&quot;null&quot;"/>
         <env name="SESSION_DRIVER" value="array"/>        
     </php>
 </phpunit>
