@@ -100,30 +100,88 @@ Start the Laravel development server from `backend/`:
 php artisan serve
 ```
 
-In a separate terminal, run one conversation worker from `backend/` with
-`composer dev:worker`. Keep `QUEUE_CONNECTION=redis` and make sure Redis is running.
-The CLI PHP runtime needs the `redis` and `pcntl` extensions.
-The AI SDK allows up to 60 seconds per provider request. The Job caps the entire
-turn (which may make multiple requests) at 240 seconds, below the default
-270-second Redis reservation and 300-second PostgreSQL claim lease. Keep
-`REDIS_QUEUE_RETRY_AFTER` above the Job timeout. The worker does not retry a Job
-on failure; PostgreSQL retains the turn for scheduled recovery.
+### Conversation worker and scheduler
 
-Run Laravel Scheduler from `backend/` in another terminal:
+After running the backend migrations, start one worker and one scheduler in
+separate terminals from `backend/`:
 
 ```bash
-php artisan schedule:work
+composer dev:worker     # php artisan queue:work redis --timeout=240 --tries=1
+composer dev:scheduler  # php artisan schedule:work
 ```
 
+The CLI PHP runtime needs `pdo_pgsql`, `redis`, and `pcntl`. Use the same `.env`
+for inbound processing, the worker, and the scheduler. Keep
+`QUEUE_CONNECTION=redis` and `CACHE_STORE=redis`, and point `DB_*`, `REDIS_HOST`
+and `REDIS_PORT` at the local Compose services. If you set `REDIS_QUEUE`,
+dispatchers and the worker must use the same queue name. For live generation,
+set `OPENAI_API_KEY` with `AI_PROVIDER=openai`; automated tests fake the provider.
+After changing `.env` or backend code, clear any cached configuration
+(`php artisan config:clear`) and restart the worker and scheduler processes.
+
+| Runtime boundary | Default |
+| --- | --- |
+| AI SDK timeout per provider request | 60 seconds |
+| Entire conversation Job and local worker timeout | 240 seconds |
+| Redis reservation (`REDIS_QUEUE_RETRY_AFTER`) | 270 seconds |
+| PostgreSQL processing and finalization claim lease | 300 seconds |
+| Normal attempts per turn (`CONVERSATION_MAX_ATTEMPTS`) | 3 |
+| Retry delays after reported failures (`CONVERSATION_RETRY_DELAYS_SECONDS`) | 30 seconds, then 120 seconds |
+| Retry delay after a recorded finalization failure (`CONVERSATION_FINALIZATION_RETRY_SECONDS`) | 120 seconds |
+| Scheduler interval / `CONVERSATION_RECONCILIATION_BATCH_SIZE` | Every minute / 100 eligible Conversations per tick |
+
+Keep the worker timeout below the Redis reservation and PostgreSQL claim lease;
+use the default `240 < 270 < 300` seconds locally. A turn can make several
+provider requests for tool use, so the worker can interrupt a turn before the SDK
+finishes all its steps. Laravel allows one execution per Job delivery payload;
+fresh Jobs from reconciliation use the same durable turn budget in PostgreSQL.
+
 Every minute, `conversation:reconcile` checks PostgreSQL and requeues up to
-100 eligible Conversations (`CONVERSATION_RECONCILIATION_BATCH_SIZE`).
-Keep `CACHE_STORE=redis` so scheduler processes share the overlap lock and
-the temporary scan cursor. Each scan cycle covers a fixed range of inbound IDs
-so new arrivals cannot delay a return to older work indefinitely. Losing the
-cursor restarts the scan in PostgreSQL.
-Use `php artisan schedule:run` to run one scheduler tick locally.
-Exhausted turns remain discoverable without another AI attempt; deterministic
-finalization is not yet implemented.
+the configured batch size of eligible Conversations. Redis cache holds the
+overlap lock and the temporary scan cursor. Each scan cycle covers a fixed
+range of inbound IDs; losing the cursor restarts the scan in PostgreSQL.
+Normal processing stops at exhaustion. Finalization can accept a deterministic
+reply from the turn's verified Appointment result, or a neutral reply if there
+is no result. Finalization does not call the model.
+
+### Inspect and troubleshoot recovery
+
+From `backend/`, use `php artisan schedule:list` to check the schedule and
+`php artisan schedule:run` to run one due tick. Keep the worker running to
+consume the queued work. `php artisan queue:failed` lists failed Laravel Job
+deliveries; the authoritative turn state and attempt budget are in `ai_turns`.
+
+Inspect a turn in the relevant PostgreSQL database. For the local development
+database, run `docker compose exec postgres psql -U appointment_assistant -d appointment_assistant`
+from the repository root, then replace `123` with the turn ID:
+
+```sql
+SELECT id, inbound_message_id, assistant_message_id, state, attempt_count,
+       claimed_until, next_attempt_at, failure_classification, failure_reason,
+       fallback_used, terminal_at, terminal_reason, diagnostics
+FROM ai_turns
+WHERE id = 123;
+```
+
+- **Committed inbound, no worker activity:** Check the Laravel log for
+  `Conversation processing job could not be queued.`, confirm Redis is
+  reachable, and check that the worker and scheduler use the same configuration.
+  Once both processes are running, the scheduler can rediscover the pending turn.
+- **Interrupted worker or retry backoff:** Restart the worker if it exited.
+  The earliest unfinished turn for that participant must be due and any claim
+  lease must expire before an eligible scheduler scan can recover it.
+- **Exhausted or interrupted finalization:** `failure_resolution_pending` and
+  `resolving_failure` still need a reply or a durable disposition. Check the
+  lease, next attempt time, and `diagnostics.finalization`; restore PostgreSQL
+  if persistence is failing. Check `fallback_used` and `assistant_message_id`
+  for accepted replies, or `terminal_reason` for `closed_without_response`.
+  `diagnostics.attempts` preserves the original failures even after fallback.
+- **Scheduler stopped during a scan:** Its overlap lock expires after five
+  minutes. If no scan is running, `php artisan schedule:clear-cache` can clear
+  a stale lock before the next tick.
+
+Use scheduled reconciliation for recovery; resetting attempt counts, editing
+claims, or replaying Appointment writes can bypass safeguards.
 
 ## Tests
 
@@ -133,7 +191,17 @@ Run the backend test suite:
 composer test
 ```
 
-Tests must use the dedicated testing database rather than the development database.
+Tests must use a dedicated testing database rather than the development database.
+Concurrent test runs need separate databases because the tests rebuild the schema.
+
+To repeat the Redis/PostgreSQL recovery scenarios with provider fakes:
+
+```bash
+vendor/bin/phpunit --filter='test_scheduler_(recovers_|exhausts_failed_generation)'
+```
+
+The crash tests start and terminate actual Redis workers on isolated test queues
+and advance the test clock to lease expiry without waiting in real time.
 
 ### Conversation retry lifecycle
 

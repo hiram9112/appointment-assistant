@@ -15,9 +15,7 @@ use App\Application\Conversation\AppointmentProposals;
 use App\Application\Conversation\AppointmentProposalState;
 use App\Application\Conversation\ConfirmAppointmentProposal;
 use App\Application\Conversation\ConversationAgent;
-use App\Application\Conversation\ConversationTurnProcessor;
 use App\Application\Conversation\PrepareAppointmentProposal;
-use App\Jobs\ProcessConversationTurn;
 use App\Models\AiTurn;
 use App\Models\Appointment;
 use App\Models\AppointmentProposal;
@@ -33,6 +31,7 @@ use Illuminate\Foundation\Testing\DatabaseMigrations;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\TestCase;
 
@@ -46,6 +45,8 @@ class AiTurnConcurrencyTest extends TestCase
     private array $workers = [];
 
     private int $nextWorker = 0;
+
+    private ?string $redisQueue = null;
 
     protected function setUp(): void
     {
@@ -64,6 +65,9 @@ class AiTurnConcurrencyTest extends TestCase
                 }
             }
             proc_close($worker['process']);
+        }
+        if ($this->redisQueue !== null) {
+            Queue::connection('redis')->clear($this->redisQueue);
         }
         parent::tearDown();
     }
@@ -712,40 +716,36 @@ class AiTurnConcurrencyTest extends TestCase
         $turns = app(AiTurnCoordinator::class);
         $failed = $turns->fail($this->business, $claim);
         $this->travelTo($failed->next_attempt_at);
-        $worker = $this->start('queued_process', [
-            'conversation' => $claim->inboundMessage->conversation_id,
-            'cancel_turn' => $claim->turnId,
+        $queueName = $this->useRedisQueue();
+        $redis = Queue::connection('redis');
+        $this->artisan('schedule:run')->assertSuccessful();
+        $this->assertSame(1, $redis->pendingSize($queueName));
+
+        $worker = $this->start('redis_worker', [
+            'queue' => $queueName,
+            'confirm_cancellation' => true,
         ], 'generate', now()->toAtomString());
         $this->assertSame("generating\n", $this->line($worker));
         $stored = $proposal->fresh()->result;
         $this->assertSame('cancelled', $stored['outcome']);
-
-        ['process' => $process, 'pipes' => $pipes] = $this->workers[$worker];
-        $this->assertTrue(proc_terminate($process, 9));
-        foreach ($pipes as $pipe) {
-            fclose($pipe);
-        }
-        proc_close($process);
-        unset($this->workers[$worker]);
+        $this->killWorker($worker);
+        $this->assertSame(1, $redis->reservedSize($queueName));
         $interrupted = AiTurn::findOrFail($claim->turnId);
         $this->assertSame(AiTurnState::Processing, $interrupted->state);
         $this->assertSame(2, $interrupted->attempt_count);
         $this->assertNull($interrupted->assistant_message_id);
 
-        Queue::fake([ProcessConversationTurn::class]);
         $this->travelTo($interrupted->claimed_until->copy()->subSecond());
         $this->artisan('schedule:run')->assertSuccessful();
-        Queue::assertNothingPushed();
+        $this->assertSame(0, $redis->pendingSize($queueName));
         $this->travel(1)->second();
         $this->artisan('schedule:run')->assertSuccessful();
         $this->travel(1)->minute();
         $this->artisan('schedule:run')->assertSuccessful();
-        Queue::assertPushedTimes(ProcessConversationTurn::class, 2);
-        [$first, $duplicate] = Queue::pushed(ProcessConversationTurn::class)->all();
-        $processor = app(ConversationTurnProcessor::class);
-        ConversationAgent::fake(function () use ($interrupted, $stored, $duplicate): string {
+        $this->assertSame(2, $redis->pendingSize($queueName));
+        ConversationAgent::fake(function () use ($interrupted, $stored, $queueName): string {
             $current = $interrupted->fresh();
-            $competitor = $this->start('queued_process', ['conversation' => $duplicate->conversationId], time: now()->toAtomString());
+            $competitor = $this->start('redis_worker', ['queue' => $queueName], time: now()->toAtomString());
             $this->assertSame(['kind' => 'job'], $this->finish($competitor));
             $this->assertSame($current->claim_token, $interrupted->fresh()->claim_token);
             $retry = new AiTurnClaim($current->id, $current->claim_token, $current->inboundMessage);
@@ -754,11 +754,12 @@ class AiTurnConcurrencyTest extends TestCase
             return 'Tu cita fue cancelada.';
         })->preventStrayPrompts();
 
-        $first->handle($processor);
-        $duplicate->handle($processor);
+        $this->artisan('queue:work', ['connection' => 'redis', '--stop-when-empty' => true, '--sleep' => 0])->assertSuccessful();
 
+        $this->assertSame(0, $redis->size($queueName));
         $this->assertSame(AiTurnState::Completed, $interrupted->refresh()->state);
         $this->assertSame(3, $interrupted->attempt_count);
+        $this->assertSame(AiTurnFailureReason::ClaimExpired->value, $interrupted->diagnostics['attempts'][2]['failure']['reason']);
         $this->assertSame('Tu cita fue cancelada.', $interrupted->assistantMessage->content);
         $this->assertDatabaseCount('conversation_messages', 4);
         $this->assertSame('cancelled', $appointment->fresh()->status);
@@ -774,28 +775,27 @@ class AiTurnConcurrencyTest extends TestCase
         $stored = app(ConfirmAppointmentProposal::class)->handle($this->business, $claim, true);
         $this->assertSame('cancelled', $stored['outcome']);
         $turn = app(AiTurnCoordinator::class)->fail($this->business, $claim, AiTurnFailure::NonRecoverable, AiTurnFailureReason::GenerationFailed);
-        $worker = $this->start('queued_process', ['conversation' => $claim->inboundMessage->conversation_id], 'after_insert', now()->toAtomString());
+        $queueName = $this->useRedisQueue();
+        $redis = Queue::connection('redis');
+        $this->artisan('schedule:run')->assertSuccessful();
+        $worker = $this->start('redis_worker', ['queue' => $queueName], 'after_insert', now()->toAtomString());
         $this->assertSame("locked\n", $this->line($worker));
         $this->assertSame(AiTurnState::ResolvingFailure, $turn->refresh()->state);
         $this->assertDatabaseCount('conversation_messages', 3);
+        $this->killWorker($worker);
+        $this->assertSame(1, $redis->reservedSize($queueName));
+        $this->assertNull($turn->fresh()->assistant_message_id);
 
-        ['process' => $process, 'pipes' => $pipes] = $this->workers[$worker];
-        $this->assertTrue(proc_terminate($process, 9));
-        foreach ($pipes as $pipe) {
-            fclose($pipe);
-        }
-        proc_close($process);
-        unset($this->workers[$worker]);
-
-        Queue::fake([ProcessConversationTurn::class]);
+        $this->business->update(['timezone' => 'UTC']);
         ConversationAgent::fake([])->preventStrayPrompts();
         $this->travelTo($turn->claimed_until);
         $this->artisan('schedule:run')->assertSuccessful();
-        $job = Queue::pushed(ProcessConversationTurn::class)->sole();
-        $processor = app(ConversationTurnProcessor::class);
-        $job->handle($processor);
-        $job->handle($processor);
+        $this->travel(1)->minute();
+        $this->artisan('schedule:run')->assertSuccessful();
+        $this->assertSame(2, $redis->pendingSize($queueName));
+        $this->artisan('queue:work', ['connection' => 'redis', '--stop-when-empty' => true, '--sleep' => 0])->assertSuccessful();
 
+        $this->assertSame(0, $redis->size($queueName));
         $this->assertSame(AiTurnState::Completed, $turn->refresh()->state);
         $this->assertTrue($turn->fallback_used);
         $this->assertSame(1, $turn->attempt_count);
@@ -803,6 +803,7 @@ class AiTurnConcurrencyTest extends TestCase
         $this->assertSame(AiTurnFailureReason::GenerationFailed, $turn->failure_reason);
         $this->assertSame(AiTurnFailureReason::ClaimExpired->value, $turn->diagnostics['finalization']['last_failure']['reason']);
         $this->assertStringContainsString('Tu cita ha sido cancelada.', $turn->assistantMessage->content);
+        $this->assertStringContainsString('01/02/2030 a las 11:00:00', $turn->assistantMessage->content);
         $this->assertSame('cancelled', $appointment->fresh()->status);
         $this->assertSame($stored, $proposal->fresh()->result);
         $this->assertDatabaseCount('conversation_messages', 4);
@@ -911,6 +912,25 @@ class AiTurnConcurrencyTest extends TestCase
         return ['turn' => $claim->turnId, 'token' => $claim->token, 'inbound' => $claim->inboundMessage->id];
     }
 
+    private function useRedisQueue(): string
+    {
+        $this->redisQueue = 'conversation-crash-test-'.Str::uuid();
+        config(['queue.default' => 'redis', 'queue.connections.redis.queue' => $this->redisQueue]);
+
+        return $this->redisQueue;
+    }
+
+    private function killWorker(int $worker): void
+    {
+        ['process' => $process, 'pipes' => $pipes] = $this->workers[$worker];
+        $this->assertTrue(proc_terminate($process, 9));
+        foreach ($pipes as $pipe) {
+            fclose($pipe);
+        }
+        proc_close($process);
+        unset($this->workers[$worker]);
+    }
+
     private function start(string $action, array $data = [], string $barrier = '', string $time = '2030-01-01 12:00:00 UTC'): int
     {
         $code = <<<'PHP'
@@ -964,20 +984,18 @@ class AiTurnConcurrencyTest extends TestCase
                         Illuminate\Support\Facades\DB::select('select pg_advisory_xact_lock(?)', [$data['locks'][1]]);
                     });
                 }
-                if (in_array($argv[2], ['sdk_process', 'queued_process'], true)) {
+                if (in_array($argv[2], ['sdk_process', 'queued_process', 'redis_worker'], true)) {
                     config(['ai.default' => 'openai', 'ai.providers.openai.models.text.default' => 'test-model']);
                     $app->bind(Laravel\Ai\Contracts\ConversationStore::class, fn () => throw new RuntimeException('Unexpected SDK storage'));
-                    App\Application\Conversation\ConversationAgent::fake(function () use ($barrier, $wait, $business, $data): string {
+                    $answer = function () use ($barrier, $wait): string {
                         if (Illuminate\Support\Facades\DB::transactionLevel() !== 0) { throw new RuntimeException('Open provider transaction'); }
-                        if (isset($data['cancel_turn'])) {
-                            $turn = App\Models\AiTurn::findOrFail($data['cancel_turn']);
-                            $claim = new App\Application\Conversation\AiTurnClaim($turn->id, $turn->claim_token, $turn->inboundMessage);
-                            $result = app(App\Application\Conversation\ConfirmAppointmentProposal::class)->handle($business, $claim, true);
-                            if ($result['outcome'] !== 'cancelled') { throw new RuntimeException('Cancellation did not commit'); }
-                        }
                         if ($barrier === 'generate') { $wait('generating'); }
                         return 'answer';
-                    })->preventStrayPrompts();
+                    };
+                    App\Application\Conversation\ConversationAgent::fake(($data['confirm_cancellation'] ?? false)
+                        ? [new Laravel\Ai\Responses\Data\ToolCall('confirm', 'ConfirmAppointmentProposalTool', ['decision' => 'confirm']), $answer]
+                        : $answer
+                    )->preventStrayPrompts();
                 }
                 $result = match ($argv[2]) {
                     'confirm_proposal' => app(App\Application\Conversation\ConfirmAppointmentProposal::class)->handle(
@@ -1059,6 +1077,16 @@ class AiTurnConcurrencyTest extends TestCase
                         (new App\Jobs\ProcessConversationTurn($data['conversation']))->handle(
                             app(App\Application\Conversation\ConversationTurnProcessor::class),
                         );
+                        App\Application\Conversation\ConversationAgent::assertNeverPrompted();
+                        return ['kind' => 'job'];
+                    })(),
+                    'redis_worker' => (function () use ($data): array {
+                        config(['queue.default' => 'redis', 'queue.connections.redis.queue' => $data['queue']]);
+                        $exit = Illuminate\Support\Facades\Artisan::call('queue:work', [
+                            'connection' => 'redis', '--max-jobs' => 1, '--stop-when-empty' => true,
+                            '--timeout' => 240, '--tries' => 1, '--sleep' => 0,
+                        ]);
+                        if ($exit !== 0) { throw new RuntimeException(Illuminate\Support\Facades\Artisan::output()); }
                         App\Application\Conversation\ConversationAgent::assertNeverPrompted();
                         return ['kind' => 'job'];
                     })(),

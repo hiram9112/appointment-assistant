@@ -4,17 +4,33 @@ namespace Tests\Feature;
 
 use App\Application\Conversation\AiTurnClaim;
 use App\Application\Conversation\AiTurnCoordinator;
+use App\Application\Conversation\AiTurnFailureReason;
 use App\Application\Conversation\AiTurnState;
+use App\Application\Conversation\AppointmentProposalState;
 use App\Application\Conversation\ConversationAgent;
 use App\Application\Conversation\ConversationTurnProcessor;
 use App\Jobs\ProcessConversationTurn;
 use App\Models\AiTurn;
+use App\Models\Appointment;
+use App\Models\AppointmentProposal;
 use App\Models\Business;
+use App\Models\ChannelIdentity;
+use App\Models\ConversationMessage;
+use App\Models\Customer;
+use App\Models\Professional;
+use App\Models\Service;
 use Illuminate\Console\Scheduling\CacheEventMutex;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Foundation\Testing\DatabaseMigrations;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Queue\Events\JobQueueing;
+use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Str;
+use Laravel\Ai\Responses\Data\ToolCall;
+use RedisException;
+use RuntimeException;
 use Tests\TestCase;
 
 class ConversationReconciliationTest extends TestCase
@@ -26,13 +42,25 @@ class ConversationReconciliationTest extends TestCase
         $this->travelTo('2030-01-01 12:00:00 UTC');
         $business = Business::factory()->create();
         $queueName = 'conversation-reconciliation-test-'.Str::uuid();
-        config(['queue.default' => 'null', 'queue.connections.redis.queue' => $queueName]);
-        $missing = $this->inbound($business, 'Dispatch never reached Redis');
+        config([
+            'queue.default' => 'redis',
+            'queue.connections.redis.queue' => $queueName,
+            'cache.default' => 'redis',
+            'cache.prefix' => $queueName.':',
+        ]);
         $redis = Queue::connection('redis');
-        config(['queue.default' => 'redis']);
+        $rejectPush = true;
+        Event::listen(JobQueueing::class, function () use (&$rejectPush): void {
+            if ($rejectPush) {
+                throw new RedisException('Simulated Redis dispatch failure');
+            }
+        });
         ConversationAgent::fake(fn (string $prompt): string => 'Answer to '.$prompt)->preventStrayPrompts();
 
         try {
+            $missing = $this->inbound($business, 'Dispatch never reached Redis');
+            $this->assertSame(0, $redis->size($queueName));
+            $rejectPush = false;
             $lost = $this->inbound($business, 'Redis lost this job', sender: 'other');
             $this->assertSame(1, $redis->size($queueName));
             $redis->clear($queueName);
@@ -45,7 +73,7 @@ class ConversationReconciliationTest extends TestCase
             $this->assertSame(4, $redis->size($queueName));
             $this->assertSame(0, $missing->fresh()->attempt_count);
             $this->assertSame(0, $lost->fresh()->attempt_count);
-            $this->artisan('queue:work', ['connection' => 'redis', '--stop-when-empty' => true])->assertSuccessful();
+            $this->workRedisQueue();
 
             $this->assertSame(0, $redis->size($queueName));
             foreach ([$missing->refresh(), $lost->refresh()] as $turn) {
@@ -56,6 +84,109 @@ class ConversationReconciliationTest extends TestCase
             $this->assertDatabaseCount('conversation_messages', 4);
             $this->assertDatabaseCount('failed_jobs', 0);
             ConversationAgent::assertPromptedTimes(2);
+        } finally {
+            $redis->clear($queueName);
+        }
+    }
+
+    public function test_scheduler_exhausts_failed_generation_and_recovers_fifo_without_authorizing_an_unaccepted_proposal(): void
+    {
+        $this->travelTo('2030-01-01 12:00:00 UTC');
+        $queueName = 'conversation-exhaustion-test-'.Str::uuid();
+        config([
+            'queue.default' => 'redis',
+            'queue.connections.redis.queue' => $queueName,
+            'conversation.processing.max_attempts' => 3,
+            'conversation.processing.retry_delays_seconds' => [30, 120],
+        ]);
+        $redis = Queue::connection('redis');
+        $business = Business::factory()->create();
+        $customer = Customer::factory()->create();
+        ChannelIdentity::factory()->for($customer)->create(['external_id' => 'sender']);
+        $appointment = Appointment::factory()->for($customer)
+            ->for(Service::factory()->for($business))->for(Professional::factory()->for($business))->create([
+                'status' => 'confirmed', 'starts_at' => '2030-02-01 10:00 UTC', 'ends_at' => '2030-02-01 11:00 UTC',
+            ]);
+        $prepareCancellation = new ToolCall('prepare', 'PrepareCancelAppointmentTool', ['appointment_id' => $appointment->id]);
+        Exceptions::fake();
+        $rejectProposal = true;
+        AppointmentProposal::creating(function () use (&$rejectProposal): void {
+            if ($rejectProposal) {
+                throw new RuntimeException('Simulated proposal persistence failure');
+            }
+        });
+        ConversationMessage::created(function (ConversationMessage $message): void {
+            if ($message->content === '¿Confirmas la cancelación?') {
+                throw new RuntimeException('Simulated assistant persistence failure');
+            }
+        });
+
+        try {
+            ConversationAgent::fake(fn () => throw new ConnectionException('Simulated provider timeout'))->preventStrayPrompts();
+            $turn = $this->inbound($business, 'Cancela mi cita', channel: 'whatsapp');
+            $this->workRedisQueue();
+            $this->assertSame(AiTurnState::Failed, $turn->refresh()->state);
+            $this->assertSame('12:00:30', $turn->next_attempt_at->format('H:i:s'));
+            $this->assertSame(ConnectionException::class, $turn->diagnostics['attempts'][1]['failure']['exception_class']);
+
+            $affirmative = $this->inbound($business, 'Sí', channel: 'whatsapp');
+            ConversationAgent::fake([])->preventStrayPrompts();
+            $this->travel(29)->seconds();
+            $this->tick();
+            $this->workRedisQueue();
+            $this->assertSame(0, $affirmative->fresh()->attempt_count);
+            ConversationAgent::assertPromptedTimes(1);
+
+            ConversationAgent::fake([
+                $prepareCancellation,
+                fn () => throw new ConnectionException('Simulated disconnect after proposal failure'),
+            ])->preventStrayPrompts();
+            $this->travel(1)->second();
+            $this->tick();
+            $this->workRedisQueue();
+            $this->assertDatabaseCount('appointment_proposals', 0);
+            $this->assertSame('12:02:30', $turn->refresh()->next_attempt_at->format('H:i:s'));
+            Exceptions::assertReported(fn (RuntimeException $exception): bool => $exception->getMessage() === 'Simulated proposal persistence failure');
+
+            $rejectProposal = false;
+            ConversationAgent::fake([$prepareCancellation, '¿Confirmas la cancelación?'])->preventStrayPrompts();
+            $this->travel(2)->minutes();
+            $this->tick();
+            $this->workRedisQueue();
+            $proposal = AppointmentProposal::sole();
+            $this->assertSame(AppointmentProposalState::Prepared, $proposal->state);
+            $this->assertSame(AiTurnState::FailureResolutionPending, $turn->refresh()->state);
+            $this->assertSame(AiTurnFailureReason::ResponsePersistenceFailed, $turn->failure_reason);
+            $this->assertDatabaseCount('conversation_messages', 2);
+            $attempts = $turn->diagnostics['attempts'];
+
+            ConversationAgent::fake([])->preventStrayPrompts();
+            $this->travel(1)->minute();
+            $this->tick();
+            $this->workRedisQueue(['--max-jobs' => 1]);
+            $this->assertSame('No pudimos completar tu solicitud. Puedes volver a intentarlo.', $turn->refresh()->assistantMessage->content);
+            $this->assertTrue($turn->fallback_used);
+            $this->assertSame(3, $turn->attempt_count);
+            $this->assertSame($attempts, $turn->diagnostics['attempts']);
+            $this->assertSame(AppointmentProposalState::Rejected, $proposal->refresh()->state);
+            $this->assertNull($proposal->confirmation_request_message_id);
+            $this->assertSame(0, $affirmative->fresh()->attempt_count);
+            ConversationAgent::assertPromptedTimes(3);
+
+            ConversationAgent::fake([
+                new ToolCall('confirm', 'ConfirmAppointmentProposalTool', ['decision' => 'confirm']),
+                'No hay una propuesta pendiente.',
+            ])->preventStrayPrompts();
+            $this->workRedisQueue();
+
+            $this->assertSame('No hay una propuesta pendiente.', $affirmative->refresh()->assistantMessage->content);
+            $this->assertSame(1, $affirmative->attempt_count);
+            $this->assertNull($proposal->fresh()->confirming_turn_id);
+            $this->assertSame('confirmed', $appointment->fresh()->status);
+            $this->assertDatabaseCount('appointment_audits', 0);
+            $this->assertDatabaseCount('conversation_messages', 4);
+            $this->assertSame(0, $redis->size($queueName));
+            ConversationAgent::assertPromptedTimes(4);
         } finally {
             $redis->clear($queueName);
         }
@@ -261,6 +392,14 @@ class ConversationReconciliationTest extends TestCase
     private function tick(): void
     {
         $this->artisan('schedule:run')->assertSuccessful();
+    }
+
+    /** @param array<string, mixed> $options */
+    private function workRedisQueue(array $options = []): void
+    {
+        $this->artisan('queue:work', [
+            'connection' => 'redis', '--stop-when-empty' => true, '--sleep' => 0, ...$options,
+        ])->assertSuccessful();
     }
 
     private function inbound(Business $business, string $content, string $sender = 'sender', string $channel = 'web'): AiTurn

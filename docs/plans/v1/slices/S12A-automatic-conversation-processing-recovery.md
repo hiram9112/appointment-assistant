@@ -1,6 +1,6 @@
 # S12A — Automatic conversation processing and recovery
 
-**Status:** Pending — implementation plan awaiting Developer approval  
+**Status:** Done  
 **Depends on:** S10, S11, S12  
 **Covers:** FR-04; FR-06; FR-07; FR-08; V1 operational readiness (cross-cutting)
 
